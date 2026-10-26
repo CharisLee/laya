@@ -34,11 +34,12 @@ public sealed class LayaRouterOptions
     public LayaOptions EngineOptions { get; set; } = new();
 
     /// <summary>
-    /// How many checkpoints stay resident at once (least-recently-used is evicted). Default 1,
-    /// matching Python. Raised automatically by <see cref="LayaRouter.Attach"/> and
+    /// How many checkpoints stay resident at once (least-recently-used is evicted). Default 2,
+    /// matching Python's <c>Router(max_loaded=2)</c>, so alternating two languages does not reload
+    /// a checkpoint on every request. Raised automatically by <see cref="LayaRouter.Attach"/> and
     /// <see cref="LayaRouter.Preload"/> to fit what they load.
     /// </summary>
-    public int MaxLoaded { get; set; } = 1;
+    public int MaxLoaded { get; set; } = 2;
 
     /// <summary>
     /// Checkpoint used when a state has no letters or its Latin language is undetermined without
@@ -50,7 +51,7 @@ public sealed class LayaRouterOptions
     public LayaCheckpoint Default { get; set; } = LayaCheckpoint.Multilingual;
 
     /// <summary>
-    /// Whether <see cref="LayaRouter.Route"/> may pick <see cref="LayaCheckpoint.TypedDecisions"/>
+    /// Whether <see cref="LayaRouter.Route(object?, QuestionSet?, string?, string?, string?)"/> may pick <see cref="LayaCheckpoint.TypedDecisions"/>
     /// on its own when the question ids match one of the four typed-decisions workflow
     /// signatures. Default <see langword="false"/>: that checkpoint is fine-tuned on specific
     /// synthetic workflows and must never be a silent default.
@@ -59,6 +60,14 @@ public sealed class LayaRouterOptions
 
     /// <summary>Whether every checkpoint should be built immediately when the router is constructed.</summary>
     public bool Preload { get; set; }
+
+    /// <summary>
+    /// A language hint applied to every request, Python's <c>Router(lang_guess=...)</c>: a language
+    /// code or a callback taking the state. Checked after an explicit <c>lang</c> and a per-call hint,
+    /// and before the built-in detection; a hint that names no language falls through to detection.
+    /// See <see cref="Laya.LangGuess"/>.
+    /// </summary>
+    public LangGuess? LangGuess { get; init; }
 }
 
 /// <summary>
@@ -93,7 +102,7 @@ public sealed class LayaRouterOptions
 /// <see cref="Attach"/> to hand the router an instance you own and will dispose yourself.
 /// </para>
 /// </remarks>
-public sealed class LayaRouter : ILayaPredictor, IDisposable
+public sealed class LayaRouter : ILayaLongPredictor, IDisposable
 {
     // Checkpoint keys people are likely to type, mapped to their canonical name. Matches
     // Python's _ALIASES exactly.
@@ -139,10 +148,16 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
     public LayaCheckpoint Default { get; }
 
     /// <summary>
-    /// Whether <see cref="Route"/> may pick <see cref="LayaCheckpoint.TypedDecisions"/> on its
+    /// Whether <see cref="Route(object?, QuestionSet?, string?, string?, string?)"/> may pick <see cref="LayaCheckpoint.TypedDecisions"/> on its
     /// own when the question ids match a typed-decisions workflow signature.
     /// </summary>
     public bool AutoTaskDetection { get; }
+
+    /// <summary>
+    /// The language hint installed with <see cref="LayaRouterOptions.LangGuess"/>, applied to every
+    /// request after a per-call hint, or <see langword="null"/>.
+    /// </summary>
+    public LangGuess? LangGuess { get; }
 
     /// <summary>Create a router that builds real <see cref="LayaEngine"/> instances on demand.</summary>
     public LayaRouter(LayaRouterOptions? options = null)
@@ -163,6 +178,7 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
         _maxLoaded = Math.Max(1, options.MaxLoaded);
         Default = options.Default;
         AutoTaskDetection = options.AutoTaskDetection;
+        LangGuess = options.LangGuess;
         if (options.Preload) Preload();
     }
 
@@ -196,12 +212,15 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
             "english" => LayaCheckpoint.English,
             "multilingual" => LayaCheckpoint.Multilingual,
             "typed-decisions" => LayaCheckpoint.TypedDecisions,
+            // Python's text, list reprs included (router.py:187): sorted(DEFAULT_MODELS), sorted(_ALIASES).
             _ => throw new ArgumentException(
-                $"unknown model '{name}'; choose one of english, multilingual, typed-decisions "
-                + $"(or an alias: {string.Join(", ", Aliases.Keys.OrderBy(k => k, StringComparer.Ordinal))})",
-                nameof(name)),
+                $"unknown model {PythonStr.Repr(name)}; choose one of {PyList(["english", "multilingual", "typed-decisions"])} "
+                + $"(or an alias: {PyList(Aliases.Keys)})"),
         };
     }
+
+    private static string PyList(IEnumerable<string> items) =>
+        "[" + string.Join(", ", items.OrderBy(k => k, StringComparer.Ordinal).Select(PythonStr.Repr)) + "]";
 
     /// <summary>
     /// Name of the typed-decisions workflow whose question ids these are, else
@@ -224,32 +243,56 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
     /// <remarks>
     /// Precedence: explicit <paramref name="model"/> &gt; explicit <paramref name="task"/> &gt;
     /// detected workflow (opt-in via <see cref="AutoTaskDetection"/>) &gt; explicit
-    /// <paramref name="lang"/> &gt; detected script/language &gt; <see cref="Default"/>.
+    /// <paramref name="lang"/> &gt; the hint installed with <see cref="LayaRouterOptions.LangGuess"/>
+    /// &gt; detected script/language &gt; <see cref="Default"/>. An explicit <paramref name="lang"/>
+    /// decides only when its code names a language (blank, <c>C</c>, <c>POSIX</c>, <c>und</c> ... fall through).
     /// </remarks>
     public RouteDecision Route(
         object? state, QuestionSet? questions = null,
         string? model = null, string? task = null, string? lang = null)
+        => Route(state, questions, model, task, lang, null);
+
+    /// <summary>
+    /// <see cref="Route(object?, QuestionSet?, string?, string?, string?)"/> with Python's per-call
+    /// <c>lang_guess</c> hint: checked after an explicit <paramref name="lang"/> and before the
+    /// built-in detection, ahead of the hint installed with <see cref="LayaRouterOptions.LangGuess"/>.
+    /// </summary>
+    public RouteDecision Route(
+        object? state, QuestionSet? questions,
+        string? model, string? task, string? lang, LangGuess? langGuess)
     {
         if (model is not null)
-            return new RouteDecision(NormaliseName(model), $"explicit model={PyRepr(model)}", null, null);
+            return new RouteDecision(NormaliseName(model), $"explicit model={PythonStr.Repr(model)}", null, null);
 
         if (task is not null)
         {
             var normalisedTaskSpelling = task.ToLowerInvariant().Replace("-", "_");
             var key = NormaliseName(normalisedTaskSpelling == "typed_decisions" ? "typed-decisions" : task);
-            return new RouteDecision(key, $"explicit task={PyRepr(task)}", null, null);
+            return new RouteDecision(key, $"explicit task={PythonStr.Repr(task)}", null, null);
         }
 
         var workflow = MatchTypedDecisionsWorkflow(questions);
         if (workflow is not null && AutoTaskDetection)
             return new RouteDecision(LayaCheckpoint.TypedDecisions,
-                $"question ids match the {PyRepr(workflow)} typed-decisions workflow", null, workflow);
+                $"question ids match the {PythonStr.Repr(workflow)} typed-decisions workflow", null, workflow);
 
         if (lang is not null)
         {
-            var primary = lang.ToLowerInvariant().Split('-')[0];
-            var key = primary is "en" or "eng" or "english" ? LayaCheckpoint.English : LayaCheckpoint.Multilingual;
-            return new RouteDecision(key, $"explicit lang={PyRepr(lang)}", null, workflow);
+            // An explicit `lang` is decisive only when the code names a language. Blank or whitespace
+            // resolves to no usable hint, so it falls through to lang_guess/detection (router.py:1242).
+            var resolved = LangGuess.EnglishFromCode(lang);
+            if (resolved is { } isEnglish)
+                return new RouteDecision(isEnglish ? LayaCheckpoint.English : LayaCheckpoint.Multilingual,
+                    $"explicit lang={PythonStr.Repr(lang)}", null, workflow);
+        }
+
+        // Caller-supplied hint, per-call first then the one installed on the router (router.py:1254).
+        foreach (var (source, hint) in new[] { ("lang_guess", langGuess), ("Router(lang_guess=...)", LangGuess) })
+        {
+            if (hint?.Resolve(state) is { } guessEnglish)
+                return new RouteDecision(guessEnglish ? LayaCheckpoint.English : LayaCheckpoint.Multilingual,
+                    $"{source}: the caller identified this as {(guessEnglish ? "English" : "non-English")} text",
+                    null, workflow);
         }
 
         var det = LanguageDetection.Analyse(state);
@@ -270,10 +313,10 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
         {
             model2 = LayaCheckpoint.Multilingual;
             reason = det.MixedSegment is { Length: > 0 } mixed
-                ? $"Latin script, mostly English, but a line or field reads as {PyRepr(det.Language!)} "
-                  + $"({PyRepr(LanguageDetection.SliceCodePoints(mixed, 60))}); the English checkpoint cannot read it"
+                ? $"Latin script, mostly English, but a line or field reads as {PythonStr.Repr(det.Language!)} "
+                  + $"({PythonStr.Repr(LanguageDetection.SliceCodePoints(mixed, 60))}); the English checkpoint cannot read it"
                 : det.Language is { } identified
-                ? $"Latin script but language looks like {PyRepr(identified)}, not English"
+                ? $"Latin script but language looks like {PythonStr.Repr(identified)}, not English"
                 // Unidentified Latin-script language: routed on the non-English letters alone,
                 // because no stopword list here covers it.
                 : $"Latin script, language not identified but {FormatPercent0(det.DiacriticRate)}% "
@@ -297,35 +340,6 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
     /// <summary>Python's <c>%.0f%%</c>: half-even rounding to the nearest integer percent.</summary>
     private static string FormatPercent0(double fraction) =>
         Math.Round(100.0 * fraction, MidpointRounding.ToEven).ToString("0", System.Globalization.CultureInfo.InvariantCulture);
-
-    /// <summary>Python's <c>%r</c> for a <see cref="string"/>: a quoted, escaped repr.</summary>
-    private static string PyRepr(string s)
-    {
-        var hasSingle = s.Contains('\'');
-        var hasDouble = s.Contains('"');
-        var quote = hasSingle && !hasDouble ? '"' : '\'';
-        var sb = new System.Text.StringBuilder(s.Length + 2);
-        sb.Append(quote);
-        foreach (var rune in s.EnumerateRunes())
-        {
-            if (rune.Value == quote) { sb.Append('\\').Append(quote); continue; }
-            switch (rune.Value)
-            {
-                case '\\': sb.Append("\\\\"); break;
-                case '\n': sb.Append("\\n"); break;
-                case '\r': sb.Append("\\r"); break;
-                case '\t': sb.Append("\\t"); break;
-                default:
-                    if (rune.Value < 0x20 || rune.Value == 0x7f)
-                        sb.Append("\\x").Append(rune.Value.ToString("x2"));
-                    else
-                        sb.Append(rune.ToString());
-                    break;
-            }
-        }
-        sb.Append(quote);
-        return sb.ToString();
-    }
 
     // ── loading ───────────────────────────────────────────────────────────────
 
@@ -475,25 +489,101 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
     public LayaResult Predict(
         object? state, QuestionSet questions,
         string? model = null, string? task = null, string? lang = null)
-    {
-        ArgumentNullException.ThrowIfNull(questions);
-        var decision = Route(state, questions, model, task, lang);
+        => Predict(state, questions, model, task, lang, null);
 
+    /// <summary>
+    /// <see cref="Predict(object?, QuestionSet, string?, string?, string?)"/> with Python's per-call
+    /// <c>lang_guess</c> hint; see <see cref="Route(object?, QuestionSet?, string?, string?, string?, LangGuess?)"/>.
+    /// </summary>
+    public LayaResult Predict(
+        object? state, QuestionSet questions,
+        string? model, string? task, string? lang, LangGuess? langGuess)
+        => PredictRouted(state, questions, model, task, lang, langGuess,
+            predictor => predictor.Predict(state, questions));
+
+    /// <summary>
+    /// Routes as <see cref="Predict(object?, QuestionSet)"/> does (no model, task, language or hint overrides), with
+    /// per-call options (a <see langword="null"/> <paramref name="options"/> gates nothing, so a literal <c>Predict(s, q, null)</c> still means what it meant); see <see cref="Predict(object?, QuestionSet, string?, string?, string?, LangGuess?, LayaPredictOptions?)"/>.
+    /// </summary>
+    public LayaResult Predict(object? state, QuestionSet questions, LayaPredictOptions? options)
+        => Predict(state, questions, null, null, null, null, options);
+
+    /// <summary>
+    /// <see cref="Predict(object?, QuestionSet, string?, string?, string?, LangGuess?)"/> with per-call options.
+    /// Ports the <c>min_confidence</c> argument of Python's <c>Router.predict</c>: the threshold is validated after the
+    /// state and questions are checked and before anything is routed or loaded, and the gate is applied to the
+    /// answers whichever checkpoint produced them. <c>PredictLong</c> takes none, as in Python.
+    /// </summary>
+    /// <exception cref="ArgumentException">The threshold is invalid, with Python's <c>ValueError</c> text.</exception>
+    public LayaResult Predict(
+        object? state, QuestionSet questions, string? model, string? task, string? lang, LangGuess? langGuess,
+        LayaPredictOptions? options)
+        => PredictRouted(state, questions, model, task, lang, langGuess,
+            predictor => predictor.Predict(state, questions), options?.MinConfidence);
+
+    LayaResult ILayaLongPredictor.PredictLong(
+        object state, QuestionSet questions, int? window, int? stride, string aggregate, int? batchSize) =>
+        PredictLong(state, questions, window, stride, aggregate, batchSize);
+
+    /// <summary>
+    /// Route using the usual model/task/lang hints, then scan the entire state. An attached predictor
+    /// must implement ILayaLongPredictor; unsupported predictors are never silently truncated.
+    /// </summary>
+    public LayaResult PredictLong(
+        object state, QuestionSet questions, int? window = null, int? stride = null,
+        string aggregate = "auto", int? batchSize = null,
+        string? model = null, string? task = null, string? lang = null)
+        => PredictLong(state, questions, window, stride, aggregate, batchSize, model, task, lang, null);
+
+    /// <summary>
+    /// <see cref="PredictLong(object, QuestionSet, int?, int?, string, int?, string?, string?, string?)"/>
+    /// with Python's per-call <c>lang_guess</c> hint; see
+    /// <see cref="Route(object?, QuestionSet?, string?, string?, string?, LangGuess?)"/>.
+    /// </summary>
+    public LayaResult PredictLong(
+        object state, QuestionSet questions, int? window, int? stride,
+        string aggregate, int? batchSize,
+        string? model, string? task, string? lang, LangGuess? langGuess)
+    {
+        StateGuard.NotNull(state);
+        return PredictRouted(state, questions, model, task, lang, langGuess, predictor =>
+            predictor is ILayaLongPredictor scanner
+                ? scanner.PredictLong(state, questions, window, stride, aggregate, batchSize)
+                : throw new NotSupportedException(
+                    $"{predictor.GetType().Name} has no PredictLong, so a state longer than its window cannot be scanned"));
+    }
+
+    private LayaResult PredictRouted(
+        object? state, QuestionSet questions, string? model, string? task, string? lang, LangGuess? langGuess,
+        Func<ILayaPredictor, LayaResult> predict, MinConfidence? minConfidence = null)
+    {
+        StateGuard.NotNull(state);
+        ArgumentNullException.ThrowIfNull(questions);
+        // router.py:1338: validated after the state and questions, before routing or loading anything.
+        var gate = minConfidence?.Check();
+        var decision = Route(state, questions, model, task, lang, langGuess);
+        // Inference runs outside the lock, exactly as Python's predict() calls
+        // agent.system_one after load() has already returned and released the lock — so
+        // concurrent predictions on a shared checkpoint are not serialised by the router.
+        var result = WithLease(decision.Model, predict);
+        return (gate is { } g ? ConfidenceGate.Apply(result, g) : result).WithRouting(decision);
+    }
+
+    // Loads (or finds) the checkpoint, holds a lease so eviction cannot dispose it mid-call, and
+    // runs `run` on it outside the lock.
+    private T WithLease<T>(LayaCheckpoint checkpoint, Func<ILayaPredictor, T> run)
+    {
         Slot slot;
         lock (_lock)
         {
             ThrowIfDisposed();
-            slot = FindOrBuild(decision.Model);
+            slot = FindOrBuild(checkpoint);
             slot.Leases++;
             Evict();
         }
         try
         {
-            // Inference runs outside the lock, exactly as Python's predict() calls
-            // agent.system_one after load() has already returned and released the lock — so
-            // concurrent predictions on a shared checkpoint are not serialised by the router.
-            var result = slot.Predictor.Predict(state, questions);
-            return result.WithRouting(decision);
+            return run(slot.Predictor);
         }
         finally
         {
@@ -504,6 +594,163 @@ public sealed class LayaRouter : ILayaPredictor, IDisposable
                     disposable.Dispose();
             }
         }
+    }
+
+    // ── batching ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Route a heterogeneous request batch without loading any checkpoint. Ports Python
+    /// <c>Router.route_batch</c> (router.py:1538): each request is validated and routed exactly as
+    /// <see cref="Route(object?, QuestionSet?, string?, string?, string?, LangGuess?)"/> does with its own
+    /// <c>Model</c>, <c>Task</c>, <c>Lang</c> and <c>LangGuess</c>, and the decisions keep input order.
+    /// </summary>
+    /// <exception cref="ArgumentException">A request is null, has a null state or null questions, or names an unknown model or task.</exception>
+    public IReadOnlyList<RouteDecision> RouteBatch(IReadOnlyList<LayaBatchRequest> requests)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        var decisions = new List<RouteDecision>(requests.Count);
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i]
+                ?? throw new ArgumentException($"request {i} must be a dict, got NoneType");
+            if (request.State is null)
+                throw new ArgumentNullException(null, $"request {i} 'state' must not be None; pass a string, dict, or list");
+            if (request.Questions is null)
+                throw new ArgumentException($"request {i} 'questions' must be a dict, got NoneType");
+            decisions.Add(Route(request.State, request.Questions, request.Model, request.Task,
+                                request.Lang, request.LangGuess));
+        }
+        return decisions;
+    }
+
+    /// <summary>
+    /// Route and answer a heterogeneous request batch with minimal checkpoint churn. Ports Python
+    /// <c>Router.predict_batch</c> (router.py:1603): requests are routed first
+    /// (<see cref="RouteBatch"/>), grouped by routed checkpoint in first-seen order, and within a
+    /// checkpoint split again by question schema (order-sensitive, router.py:221) so states sharing
+    /// a schema share forward passes via <see cref="ILayaBatchPredictor.PredictBatch"/>. Results are
+    /// returned in input order, each carrying its <see cref="LayaResult.Routing"/>.
+    /// </summary>
+    /// <param name="requests">The requests; an empty list returns an empty list and loads nothing.</param>
+    /// <param name="options">Passed to every checkpoint batch; <see cref="LayaBatchOptions.SortByLength"/>
+    /// acts per question group, as in Python. <see cref="LayaBatchOptions.MinConfidence"/> is batch-wide: it is
+    /// applied by the router to every result, is not passed to the checkpoints, and is not part of the grouping.</param>
+    /// <exception cref="NotSupportedException">A routed checkpoint (an attached predictor) has no batch support.</exception>
+    public IReadOnlyList<LayaResult> PredictBatch(
+        IReadOnlyList<LayaBatchRequest> requests, LayaBatchOptions? options = null)
+    {
+        // router.py:1669: validated before any request is looked at.
+        var gate = options?.MinConfidence?.Check();
+        // router.py:1789 calls the agent without min_confidence and gates the results itself.
+        var inner = options is { MinConfidence: not null }
+            ? new LayaBatchOptions { BatchSize = options.BatchSize, SortByLength = options.SortByLength }
+            : options;
+        var decisions = RouteBatch(requests);
+        if (decisions.Count == 0) return [];
+
+        // First-seen order, so cache effects stay deterministic and an interleaved workload costs at
+        // most one load per routed checkpoint (router.py:1674).
+        var checkpoints = new List<LayaCheckpoint>();
+        var byCheckpoint = new Dictionary<LayaCheckpoint, List<int>>();
+        for (var i = 0; i < decisions.Count; i++)
+        {
+            if (!byCheckpoint.TryGetValue(decisions[i].Model, out var indices))
+            {
+                byCheckpoint[decisions[i].Model] = indices = [];
+                checkpoints.Add(decisions[i].Model);
+            }
+            indices.Add(i);
+        }
+
+        var results = new LayaResult[requests.Count];
+        foreach (var checkpoint in checkpoints)
+        {
+            var indices = byCheckpoint[checkpoint];
+            WithLease(checkpoint, predictor =>
+            {
+                if (predictor is not ILayaBatchPredictor batcher)
+                    throw new NotSupportedException(
+                        $"{predictor.GetType().Name} has no PredictBatch, so requests cannot share forward passes");
+                foreach (var (questions, group) in GroupBySchema(requests, indices))
+                {
+                    var batch = batcher.PredictBatch([.. group.Select(i => requests[i].State)], questions, inner);
+                    if (batch.Count != group.Count)
+                        throw new InvalidOperationException(
+                            $"internal error: Agent.predict_batch returned {batch.Count} results for {group.Count} states");
+                    for (var k = 0; k < batch.Count; k++)
+                        results[group[k]] = (gate is { } g ? ConfidenceGate.Apply(batch[k], g) : batch[k])
+                            .WithRouting(decisions[group[k]]);
+                }
+                return 0;
+            });
+        }
+        return results;
+    }
+
+    // Splits one checkpoint's requests by question schema, first-seen order (router.py:1726-1776). A
+    // later per-request token budget or lang joins the grouping key here.
+    private static List<(QuestionSet Questions, List<int> Indices)> GroupBySchema(
+        IReadOnlyList<LayaBatchRequest> requests, List<int> indices)
+    {
+        var groups = new List<(string Schema, QuestionSet Questions, List<int> Indices)>();
+        QuestionSet? lastQuestions = null;
+        string? lastSchema = null;
+        foreach (var i in indices)
+        {
+            var questions = requests[i].Questions;
+            string schema;
+            if (ReferenceEquals(questions, lastQuestions)) schema = lastSchema!;
+            else
+            {
+                schema = QuestionSchema(questions);
+                lastQuestions = questions;
+                lastSchema = schema;
+            }
+            var at = groups.FindIndex(g => g.Schema == schema);
+            if (at < 0) groups.Add((schema, questions, [i]));
+            else groups[at].Indices.Add(i);
+        }
+        return [.. groups.Select(g => (g.Questions, g.Indices))];
+    }
+
+    /// <summary>
+    /// Order-sensitive signature of a question set, for sharing forward passes (router.py:221): ids, types,
+    /// instructions, labels and rendered options all count, in declaration order.
+    /// </summary>
+    internal static string QuestionSchema(QuestionSet questions)
+    {
+        // json.dumps(questions, sort_keys=False, ensure_ascii=False, default=str): insertion order at
+        // every level, ", " / ": " separators, Python float repr (so 1 and 1.0 differ). A question
+        // carries no memory of how its dict was spelled, so each is written in canonical key order
+        // (type, instructions, criteria) and a noul only lists the wordings it was given.
+        var all = new List<KeyValuePair<string, object?>>();
+        foreach (var (id, question) in questions)
+        {
+            var entry = new List<KeyValuePair<string, object?>>
+            {
+                new("type", SequenceBuilder.TypeName(question.Type)),
+                new("instructions", question.Instructions),
+            };
+            switch (question)
+            {
+                case ChoiceQuestion choice:
+                    entry.Add(new("criteria", choice.Options.ToList()));
+                    break;
+                case ScoreQuestion score:
+                    entry.Add(new("criteria", score.Levels));
+                    break;
+                case NoulQuestion { IfFalse: null, IfTrue: null }:
+                    break;
+                case NoulQuestion noul:
+                    var wording = new List<KeyValuePair<string, object?>>();
+                    if (noul.IfFalse is not null) wording.Add(new("false", noul.IfFalse));
+                    if (noul.IfTrue is not null) wording.Add(new("true", noul.IfTrue));
+                    entry.Add(new("criteria", wording));
+                    break;
+            }
+            all.Add(new(id, entry));
+        }
+        return PythonJson.Dumps(all, escapeNonAscii: false, fallbackToStr: true);
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

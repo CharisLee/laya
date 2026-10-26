@@ -23,8 +23,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import laya  # noqa: E402
-from laya import Agent, BaseHook, PredictContext, PredictHook, Router, load  # noqa: E402
-from laya.hooks import HOOK_EVENTS, Hook  # noqa: E402
+from laya import Agent, AsyncHook, BaseHook, OptionStabilityHook, PredictContext, PredictHook, Router, load  # noqa: E402
+from laya.hooks import HOOK_EVENTS, Hook, calibrate_reliability, decide_reliability  # noqa: E402
 from laya.onnx_agent import ONNXAgent  # noqa: E402
 from laya.router import _question_schema  # noqa: E402
 
@@ -70,6 +70,10 @@ HOOK_KEYS = {
 }
 
 # --------------------------------------------------------------- constructors
+check("HTTP SDK stays outside core exports", "LayaClient" in laya.__all__, False)
+check("HTTP batch response stays outside core exports", "BatchPrediction" in laya.__all__, False)
+check("core does not import the HTTP SDK", "laya_client" in sys.modules, False)
+
 for label, fn in (("Agent.__init__", Agent.__init__), ("load", load),
                   ("Router.__init__", Router.__init__), ("ONNXAgent.__init__", ONNXAgent.__init__)):
     for param, default in HOOK_KEYS.items():
@@ -82,6 +86,17 @@ for label, fn in (("Agent.__init__", Agent.__init__), ("load", load)):
 
 # Python and TypeScript share the 0.4.0 fallback for unidentified text.
 check_param("Router.__init__", Router.__init__, "default", "multilingual")
+
+# OptionStabilityHook parameters (#635)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "accept", inspect.Parameter.empty, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "escalate", inspect.Parameter.empty, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "probes", None, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "n_shuffles", 3, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "relabel", True, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "rename_max_options", 20, inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "variants", "full", inspect.Parameter.KEYWORD_ONLY)
+check_param("OptionStabilityHook.__init__", OptionStabilityHook.__init__, "seed", None, inspect.Parameter.KEYWORD_ONLY)
+
 # Router keeps lang_guess and explicit per-model revisions too
 check_param("Router.__init__", Router.__init__, "lang_guess", None)
 check_param("Router.__init__", Router.__init__, "revisions", None)
@@ -151,6 +166,41 @@ check_true("Agent.backend_object is a property", isinstance(Agent.backend_object
 
 # ONNXAgent downloads the same Hub artifacts as Agent, so it authenticates the same way
 check_param("ONNXAgent.__init__", ONNXAgent.__init__, "token", None)
+
+# AsyncHook wraps async hooks with an optional loop
+check_param("AsyncHook.__init__", AsyncHook.__init__, "loop", None)
+
+# OptionStabilityHook (issue #635)
+check_true("OptionStabilityHook is a BaseHook", issubclass(OptionStabilityHook, BaseHook))
+
+# Public calibration cuts retain input precision through JSON serialization. Replaying
+# the cuts must not merge distinct scores that happen to share a four-place display.
+_precise_scores = json.loads(json.dumps([0.80001, 0.80002]))
+_precise_cuts = calibrate_reliability(_precise_scores, [False, True], target_accuracy=1.0)
+_precise_cuts = json.loads(json.dumps(_precise_cuts))
+check("calibrate_reliability returns an observed full-precision cut", _precise_cuts[0], 0.80002)
+check("serialized calibration cuts preserve accepted membership",
+      [decide_reliability(score, *_precise_cuts) for score in _precise_scores],
+      ["VERIFY", "ACCEPT"])
+
+# Invalid calibration evidence raises at the public boundary instead of fitting a gate.
+for _name, _scores, _labels, _kwargs, _error in (
+    ("empty", [], [], {}, ValueError),
+    ("unmatched labels", [0.9, 0.9], [True], {}, ValueError),
+    ("unmatched scores", [0.9], [True, False], {}, ValueError),
+    ("nonfinite score", [0.9, float("nan")], [True, False], {}, ValueError),
+    ("nonboolean labels", [0.9, 0.9], [2, 0], {}, TypeError),
+    ("invalid target", [0.9], [False], {"target_accuracy": -0.1}, ValueError),
+    ("invalid escalation target", [0.9], [False], {"max_escalate_accuracy": float("nan")}, ValueError),
+):
+    try:
+        calibrate_reliability(_scores, _labels, **_kwargs)
+    except _error:
+        check_true("calibrate_reliability rejects " + _name, True)
+    except Exception as _exc:
+        check_true("calibrate_reliability rejects " + _name, False, repr(_exc))
+    else:
+        check_true("calibrate_reliability rejects " + _name, False, "did not raise")
 
 # --------------------------------------------------------------- predict surfaces
 from laya.mcp.remote import RemoteRouter  # noqa: E402
@@ -222,6 +272,19 @@ check("predict_tournament/positional prefix",
       ["agent", "state", "questions", "group_size"])
 check_param("predict_tournament", laya.predict_tournament, "predict_kwargs", inspect.Parameter.empty,
             inspect.Parameter.VAR_KEYWORD)
+
+# Detection diagnostics are opt-in and do not replace existing analysis fields.
+from laya.lang import analyse, latin_profile  # noqa: E402
+
+for label, fn in (("analyse", analyse), ("Router.route", Router.route),
+                  ("Router.route_batch", Router.route_batch)):
+    check_param(label, fn, "explain", False, inspect.Parameter.KEYWORD_ONLY)
+check("latin_profile keeps its signature", list(sig(latin_profile)), ["text"])
+_plain_analysis = analyse("Turn lights off")
+_explained_analysis = analyse("Turn lights off", explain=True)
+check("analyse opts into one extra key", set(_explained_analysis) - set(_plain_analysis), {"diagnostic"})
+check("analyse diagnostic fields", set(_explained_analysis.pop("diagnostic")), {"stage", "reason", "source"})
+check("analyse retains original fields", _explained_analysis, _plain_analysis)
 
 # route() and route_batch() take per-call hooks so a hook can pin a checkpoint for one call
 for label, fn in (("Router.route", Router.route),
@@ -379,7 +442,8 @@ for label, cls in (("LayaRouter", LayaRouter), ("LayaGuardrail", LayaGuardrail),
 from laya.integrations.langchain import LayaDecision  # noqa: E402
 
 for param, default in (("return_details", False), ("state_key", None), ("agent", None),
-                       ("base_url", None), ("api_key", None), ("model", None)):
+                       ("base_url", None), ("api_key", None), ("model", None),
+                       ("task", None), ("lang_guess", None)):
     check_param("LayaDecision.__init__", LayaDecision.__init__, param, default)
 check_param("LayaDecision.__init__", LayaDecision.__init__, "decision_schema",
             inspect.Parameter.empty, inspect.Parameter.POSITIONAL_OR_KEYWORD)
@@ -1089,6 +1153,16 @@ check_param("evaluate_shortlist", evaluate_shortlist, "k", 20)
 check_param("evaluate_shortlist", evaluate_shortlist, "dataset_path", None)
 for param in ("checkpoint_id", "embedder_id"):
     check_param("evaluate_shortlist", evaluate_shortlist, param, inspect.Parameter.empty)
+# The framework integrations send the two routing hints (`task`, `lang_guess`) in the same body, so
+# "a chain step and a raw HTTP client get the same answer" has to hold of them too. If serve dropped
+# one from `BODY_CONTROLS`, a wrapper sending it would get a 422 its caller cannot fix from the
+# integrations -- this says so at the shared declaration instead of at a request.
+from laya.integrations._controls import ROUTER_ONLY_CONTROLS as _router_only  # noqa: E402
+
+check("serve accepts every routing hint an integration sends",
+      [key for key in _router_only if key not in _http_controls], [])
+check("routing hints are not among serve's refusals",
+      sorted(set(_router_only) & set(_http_refusals)), [])
 
 from laya.evals_tournament import evaluate_tournament  # noqa: E402
 
@@ -1562,6 +1636,14 @@ check("README route_batch clause names exactly its hooks kwargs",
 from laya import hooks as _hooks_mod  # noqa: E402
 
 check_true("hooks module exports compose_hooks", callable(_hooks_mod.compose_hooks))
+
+# The local TypeScript stability port consumes these reference helper contracts.
+check("stability/make_variants reference parameters", list(sig(_hooks_mod.make_variants)),
+      ["labels", "seed_key", "n_shuffles", "relabel", "include", "reorder"])
+check("stability/calibrate_reliability reference parameters", list(sig(_hooks_mod.calibrate_reliability)),
+      ["soft_scores", "correct", "target_accuracy", "max_escalate_accuracy"])
+check("stability/decide_reliability reference parameters", list(sig(_hooks_mod.decide_reliability)),
+      ["soft_stability", "accept", "escalate"])
 
 _patterns_md = os.path.join(REPO, "docs", "hooks", "patterns.md")
 with open(_patterns_md, encoding="utf-8", newline="") as _pmf:

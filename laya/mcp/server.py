@@ -7,7 +7,19 @@ wired to any MCP client (OpenClaw, Claude Desktop, cursor, ...):
     python -m laya.mcp.server
 
 Environment (same meaning as laya.serve where it exists):
-  LAYA_DEVICE   torch device for the checkpoints (value goes straight to torch)
+  LAYA_DEVICE   the device the checkpoints are asked to build on. Not the value verbatim:
+                laya.mcp.device.env_device strips and lower-cases it (`CUDA:0` -> `cuda:0`)
+                and refuses with a ValueError naming this variable a string torch cannot parse
+                (`gpu`, `cuda:`, `cuda: 0`) or parses into some other device (`cuda:258` asks for
+                GPU 2), so the failure reads as a bad environment value
+                rather than a torch internal one -- here as a `router construction failed` tool
+                error, because a stdio server has no startup to refuse. A preference, not a
+                guarantee: as in laya.serve an unavailable GPU falls back to CPU silently, and
+                laya_status then answers the loaded agent's real device (before any load it
+                answers this preference, flagged with `device_is_preference`). It answers one
+                device, though: with two checkpoints resident on different devices the top-level
+                `device` is the first entry of `loaded` (the least recently used), so
+                `checkpoint_devices` is the field that says where each one actually runs.
   LAYA_PRELOAD  "0" to build the checkpoints lazily instead of at startup (default on)
   LAYA_MODELS   comma list to preload; MCP default is "english,multilingual" so
                 typed-decisions stays lazy (in laya.serve an empty value preloads all)
@@ -52,6 +64,7 @@ from .tools import (
     get_available_presets,
     laya_predict,
     laya_predict_batch,
+    laya_predict_long,
     laya_preset,
     laya_route,
     laya_route_batch,
@@ -352,10 +365,15 @@ def laya_predict_batch_tool(requests: list, batch_size: int = 0, hooks_timeout: 
     # for had been dropped.
     if not isinstance(hooks_timeout, bool) and hooks_timeout == 0:
         hooks_timeout = None
+    # `batch_size` gets the same boolean-aware collapse for the same reason: `False == 0`, so a plain
+    # `or None` fold turned a caller's explicit `batch_size=false` into "no cap" and hid the
+    # `_validate_batch_size` refusal that a `batch_size=true` already reaches.
+    if not isinstance(batch_size, bool) and batch_size == 0:
+        batch_size = None
     return _wrap(
         laya_predict_batch,
         requests=requests,
-        batch_size=batch_size or None,
+        batch_size=batch_size,
         hooks_timeout=hooks_timeout,
         min_confidence=min_confidence,
         sort_by_length=sort_by_length,
@@ -382,11 +400,15 @@ def laya_route_batch_tool(requests: list, hooks_timeout: float = 0) -> str:
     """Route many requests to checkpoints without a forward pass."""
     router = _router_or_error()
     # hooks_timeout=0 means "unset": MCP clients send defaults eagerly, and
-    # None is what Router.route_batch takes as "use my own timeout".
+    # None is what Router.route_batch takes as "use my own timeout". Only a numeric 0 collapses:
+    # `False == 0`, and `laya_route_batch` refuses a boolean timeout the way `laya_predict_batch`
+    # does, so folding `false` into unset here would answer the caller's request with silence.
+    if not isinstance(hooks_timeout, bool) and hooks_timeout == 0:
+        hooks_timeout = None
     return _wrap(
         laya_route_batch,
         requests=requests,
-        hooks_timeout=hooks_timeout or None,
+        hooks_timeout=hooks_timeout,
         router=router,
     )
 
@@ -571,6 +593,33 @@ def laya_decide_tool(state: dict, schema: dict, model: str | None = None,
     router = _router_or_error()
     return _wrap(laya_decide, state=state, schema=schema, model=model,
                  min_confidence=min_confidence, router=router)
+
+
+@server.tool(
+    name="laya_predict_long",
+    description=(
+        "Answer typed questions over a state longer than the context window: the state is "
+        "scanned in overlapping windows in shared forward passes and aggregated per question "
+        "(strongest window for noul, most-confident window for choice/score). Use this instead "
+        "of laya_predict whenever the state does not fit one window -- laya_predict answers "
+        "from its first window and never reads the rest. Returns the answers, each with the "
+        "deciding window's attribution, plus the window count. "
+        "window / stride: positive integers sizing the scan (a smaller window isolates a "
+        "localized span); unset means the checkpoint budget and 50% overlap. "
+        "task: name a checkpoint by what the work is -- refused on a call that also pins model. "
+        "lang: a language code -- routes non-English text and selects that checkpoint's "
+        "per-language calibration. "
+        + _GUARDRAILS
+        + _MODEL_DOC
+    ),
+)
+def laya_predict_long_tool(state: dict, questions: dict, model: str = "auto",
+                           window: int | None = None, stride: int | None = None,
+                           task: str | None = None, lang: str | None = None) -> str:
+    """Scan a long state in windows, then answer."""
+    router = _router_or_error()
+    return _wrap(laya_predict_long, state=state, questions=questions, model=model,
+                 window=window, stride=stride, task=task, lang=lang, router=router)
 
 
 def main() -> None:

@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import laya.agent as _agent_mod  # noqa: E402
 from laya.agent import Agent  # noqa: E402
-from laya.hooks import normalise_hooks  # noqa: E402
+from laya.hooks import OptionStabilityHook, normalise_hooks  # noqa: E402
 from laya.router import RouteDecision, Router  # noqa: E402
 
 PASS, FAIL = [], []
@@ -1443,7 +1443,9 @@ contexts = []
 
 def slow_start(ctx):
     time.sleep(0.01)
-    contexts.append(id(ctx))
+    # Keep the context itself, not id(ctx): once a call returns its context can be freed and
+    # a later call's context can reuse the address, so ids alone undercount on a busy machine.
+    contexts.append(ctx)
 
 
 f = make_fake()
@@ -1454,7 +1456,7 @@ for t in threads:
     t.start()
 for t in threads:
     t.join()
-check("concurrency/one independent context per call", len(set(contexts)), 5)
+check("concurrency/one independent context per call", len({id(c) for c in contexts}), 5)
 
 
 class ConcHook:
@@ -1767,6 +1769,35 @@ check_raises("timeout/negative is rejected", ValueError, lambda: validate_timeou
 check_raises("timeout/NaN is rejected", ValueError, lambda: validate_timeout(float("nan")))
 check_raises("timeout/infinity is rejected", ValueError, lambda: validate_timeout(float("inf")))
 check_raises("timeout/-infinity is rejected", ValueError, lambda: validate_timeout(float("-inf")))
+check_raises("timeout/True is rejected", ValueError, lambda: validate_timeout(True))
+check_raises("timeout/False is rejected", ValueError, lambda: validate_timeout(False))
+# A shape `float()` cannot read is still a bad timeout: a list/object used to leak TypeError and a
+# JSON integer too large for a float leaked OverflowError. Both must raise the same ValueError, and
+# the OverflowError case is what let a giant JSON number reach `laya/mcp/tools.py` (which catches
+# only TypeError/ValueError) and surface as `internal_error`.
+check_raises("timeout/list is rejected", ValueError, lambda: validate_timeout([10]))
+check_raises("timeout/dict is rejected", ValueError, lambda: validate_timeout({"a": 1}))
+check_raises("timeout/oversized int is rejected", ValueError, lambda: validate_timeout(10 ** 1000))
+
+
+# The refusal has to say *why*. `False` raises either way -- as a wrong type here, as a non-positive
+# number in the branch below -- so an arm that only checks the exception type cannot tell the two
+# apart, and a guard that simply fell through would pass it. `0` keeps the original wording.
+def _timeout_message(value):
+    try:
+        validate_timeout(value)
+    except ValueError as exc:
+        return str(exc)
+    return "<accepted>"
+
+
+check_true("timeout/a bool is refused as a bool", "not a bool" in _timeout_message(True),
+           _timeout_message(True))
+check_true("timeout/False is refused as a bool too", "not a bool" in _timeout_message(False),
+           _timeout_message(False))
+check_true("timeout/zero keeps the non-positive wording",
+           "not a bool" not in _timeout_message(0) and "positive finite" in _timeout_message(0),
+           _timeout_message(0))
 check("timeout/positive passes through", validate_timeout(1.5), 1.5)
 check("timeout/None means no limit", validate_timeout(None), None)
 
@@ -1777,6 +1808,17 @@ check_raises("timeout/NaN per call is rejected", ValueError,
              lambda: f.predict_batch(["s0"], QUESTIONS, hooks_timeout=float("nan")))
 check_raises("timeout/infinity per call is rejected", ValueError,
              lambda: f.predict_batch(["s0"], QUESTIONS, hooks_timeout=float("inf")))
+
+# `float(True) == 1.0`, so `hooks_timeout=True` -- which reads like "yes, time the hooks" -- used to
+# install a one-second deadline on every hook call, and `False` was refused as a non-positive number,
+# the wrong reason for a wrong type. Both spellings now raise where they are set, per call and at
+# construction alike; an int and a numeric string are not bools and still bound the wait.
+check_raises("timeout/True per call is rejected", ValueError,
+             lambda: f.predict_batch(["s0"], QUESTIONS, hooks_timeout=True))
+check_raises("timeout/True at construction is rejected", ValueError,
+             lambda: Router(hooks_timeout=True))
+check("timeout/int still bounds", Router(hooks_timeout=1).hooks_timeout, 1.0)
+check("timeout/numeric string still bounds", Router(hooks_timeout="0.5").hooks_timeout, 0.5)
 
 not_running = asyncio.new_event_loop()
 try:
@@ -1965,6 +2007,46 @@ check_raises("router_batch/route_batch rejects positional hooks", TypeError,
              lambda: r_pos.route_batch([req("pos1")], 1.0, [RouteTrace()]))
 check_raises("router_batch/predict_batch rejects positional hooks", TypeError,
              lambda: r_pos.predict_batch([req("pos2")], 8, 1.0, None, False, [PerCallTrace()]))
+
+# --------------------------------------------------------------- OptionStabilityHook (issue #635)
+check_raises("stability/missing accept and escalate", TypeError, lambda: OptionStabilityHook())
+check_raises("stability/negative n_shuffles", ValueError, lambda: OptionStabilityHook(accept=0.8, escalate=0.6, n_shuffles=-1))
+check_raises("stability/bool n_shuffles", ValueError, lambda: OptionStabilityHook(accept=0.8, escalate=0.6, n_shuffles=True))
+check_raises("stability/unknown variants", ValueError, lambda: OptionStabilityHook(accept=0.8, escalate=0.6, variants="invalid"))
+check_raises("stability/empty variants", ValueError, lambda: OptionStabilityHook(accept=0.8, escalate=0.6, variants=[]))
+check_raises("stability/escalate > accept", ValueError, lambda: OptionStabilityHook(accept=0.5, escalate=0.8))
+
+stab_hook = OptionStabilityHook(accept=0.77, escalate=0.61, seed="test-seed")
+stab_q = {"choice_q": {"type": "choice", "instructions": "Pick?", "criteria": {"a": "opt 1", "b": "opt 2"}}}
+stab_ctx = PredictContext(states=["state 1"], questions=dict(stab_q))
+stab_hook.on_predict_start(stab_ctx)
+check_true("stability/injects variant questions", any(k.startswith("choice_q::rel") for k in stab_ctx.questions))
+
+sim_answers = {}
+for k, q_def in stab_ctx.questions.items():
+    crit = q_def["criteria"]
+    target = [name for name, desc in crit.items() if desc == "opt 1"][0]
+    sim_answers[k] = {
+        "type": "choice",
+        "choice": target,
+        "probabilities": {name: (0.9 if name == target else 0.1) for name in crit},
+        "answer_confidence": 0.9,
+    }
+
+stab_ctx.results = [{
+    "model": "fake",
+    "answers": sim_answers,
+    "usage": {"truncated_questions": ["choice_q::rel1"]},
+}]
+stab_hook.on_predict_end(stab_ctx)
+stab_ans = stab_ctx.results[0]["answers"]
+check_true("stability/cleans variant keys", not any("::rel" in k for k in stab_ans))
+check("stability/keeps choice", stab_ans["choice_q"]["choice"], "a")
+check_true("stability/adds reliability", "reliability" in stab_ans["choice_q"])
+check("stability/accept decision", stab_ans["choice_q"]["reliability"]["decision"], "ACCEPT")
+check("stability/stability 1.0", stab_ans["choice_q"]["reliability"]["stability"], 1.0)
+check("stability/probes list", stab_ans["choice_q"]["reliability"]["probes"], ["reorder", "rename"])
+check("stability/cleans usage", stab_ctx.results[0]["usage"]["truncated_questions"], [])
 
 
 # --------------------------------------------------------------- docs prose for plain callables

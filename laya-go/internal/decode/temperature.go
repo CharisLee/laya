@@ -76,15 +76,38 @@ func NewTemperatures(byType []any, byOptions map[string]any, byLanguage map[stri
 	for lang := range byLanguage {
 		langs = append(langs, lang)
 	}
+	seen := map[string]string{}
 	sort.Strings(langs) // a repeated primary subtag resolves the same way on every run
 	for _, lang := range langs {
 		resolved, err := resolveLanguage(lang, byLanguage[lang], base)
 		if err != nil {
 			return nil, err
 		}
+		p := primarySubtag(lang)
+		if first, dup := seen[p]; dup {
+			return nil, fmt.Errorf("decode: language overrides %q and %q share the primary subtag %q; Python keeps the last inserted, which a Go map cannot say, so give one", first, lang, p)
+		}
+		seen[p] = lang
 		t.ByLanguage[primarySubtag(lang)] = resolved
 	}
 	return t, nil
+}
+
+// Calibrated is t with the type and bucket tables and the binning map replaced, as
+// apply_calibration_payload does: language overrides stay as Open resolved them. byType holds
+// three raw values; every value is clamped.
+func (t *Temperatures) Calibrated(byType []any, byOptions map[string]any, binning map[string]Bins) *Temperatures {
+	out := &Temperatures{ByOptions: make(map[string]float64, len(byOptions)), Binning: binning}
+	if t != nil {
+		out.ByLanguage = t.ByLanguage
+	}
+	for i, v := range byType {
+		out.ByType[i] = Clamp(v)
+	}
+	for bucket, v := range byOptions {
+		out.ByOptions[bucket] = Clamp(v)
+	}
+	return out
 }
 
 // primarySubtag is lang.split("-")[0].lower().
@@ -113,7 +136,7 @@ func resolveLanguage(lang string, raw any, base []any) (LanguageTemperatures, er
 	for i, v := range list {
 		out.ByType[i] = Clamp(v)
 	}
-	if bo := cfg["temperature_by_options"]; bo != nil {
+	if bo := cfg["temperature_by_options"]; !falsy(bo) { // `or {}`: false, 0, "", [] and {} are empty
 		m, ok := asMap(bo)
 		if !ok {
 			return LanguageTemperatures{}, fmt.Errorf("decode: language override %q temperature_by_options must be a mapping of bucket -> float, got %T", lang, bo)
@@ -217,12 +240,7 @@ func toFloat(v any) (float64, bool) {
 		f, _ := new(big.Float).SetInt(x).Float64()
 		return f, true
 	case string:
-		s := unicodedata.Strip(x)
-		if strings.ContainsAny(s, "xXpP_") { // Go reads hex floats and Python does not
-			return 0, false
-		}
-		f, err := strconv.ParseFloat(s, 64)
-		return f, err == nil
+		return PyFloat(x)
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -234,7 +252,62 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
+// PyFloat is float(s) for a string: surrounding space, Unicode decimal digits, single underscores
+// between digits, and a signed nan, inf or infinity in any case. Go's hex floats are refused. A
+// value past the float range is infinite, as in Python.
+func PyFloat(s string) (float64, bool) {
+	s = unicodedata.DecimalASCII(unicodedata.StripNumeric(s))
+	if strings.ContainsAny(s, "xXpP") {
+		return 0, false
+	}
+	if strings.Contains(s, "_") {
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			if s[i] == '_' {
+				if i == 0 || i+1 == len(s) || !isDigit(s[i-1]) || !isDigit(s[i+1]) {
+					return 0, false
+				}
+				continue
+			}
+			b.WriteByte(s[i])
+		}
+		s = b.String()
+	}
+	if u := strings.TrimLeft(s, "+-"); len(s)-len(u) == 1 && strings.EqualFold(u, "nan") {
+		return math.NaN(), true
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	return f, err == nil || isRange(err)
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
 func isRange(err error) bool {
 	ne, ok := err.(*strconv.NumError)
 	return ok && ne.Err == strconv.ErrRange
+}
+
+// falsy is Python truthiness for the values `cfg.get(...) or {}` meets: None, False, zero, "" and
+// an empty container.
+func falsy(v any) bool {
+	if n, ok := v.(json.Number); ok { // a string kind: checked before the reflect switch
+		f, err := n.Float64()
+		return err == nil && f == 0
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Invalid:
+		return true
+	case reflect.Bool:
+		return !rv.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return rv.Float() == 0
+	case reflect.String, reflect.Slice, reflect.Array, reflect.Map:
+		return rv.Len() == 0
+	}
+	return false
 }

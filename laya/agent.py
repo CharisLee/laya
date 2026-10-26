@@ -40,7 +40,6 @@ from .common import (
     _disable_question_token_reuse,
     encode_text,
     render_criterion,
-    render_options,
     resolve_lang_temperatures,
     serialize_state,
     temp_bucket,
@@ -314,7 +313,13 @@ def _cpu_amp_dtype() -> Optional[torch.dtype]:
     """Autocast dtype on CPU: bf16 when LAYA_CPU_AMP=bf16|bfloat16, None to leave the forward in
     fp32. No fp16 spelling is offered here, because CPU autocast has no fp16 fast path that beats
     fp32 -- bf16 is the only reduced precision worth asking for, and only on hardware with native
-    BF16 instructions, which is why it stays opt-in. Anything else is ignored."""
+    BF16 instructions, which is why it stays opt-in. Anything else is ignored.
+
+    On hardware without those instructions the failure is a native fault, not an exception:
+    oneDNN picks a kernel the CPU cannot execute and the process dies with SIGILL, or
+    `0xC000001D` on Windows. `_infer`'s autocast retry catches `RuntimeError`, so it cannot
+    see that and cannot fall back. Qualify the host first; `docs/reference/agent.md` has the
+    one-line child-process probe and the `get_cpu_capability()` reading to check."""
     if os.environ.get("LAYA_CPU_AMP", "").lower() in ("bf16", "bfloat16"):
         return torch.bfloat16
     return None
@@ -1154,7 +1159,7 @@ class Agent(HookRegistry):
                 self.tok, state, q, max_len, head_max_len, option_order=q.get("option_order"),
                 truncate_left=truncate_left, state_ids=state_ids, return_stats=True,
                 return_truncation_stats=True, return_layout=self.parallel_options)
-            n_opts = len(render_options(q))
+            n_opts = stats["options"]
             if len(markers) != n_opts:
                 # The markers are placed at absolute positions and `build_sequence` then drops the
                 # ones past `max_len`, so this is about the question fitting in the sequence --
@@ -1340,7 +1345,7 @@ class Agent(HookRegistry):
                 t_scale = l_cfg["temperature_by_options"].get(temp_bucket(qt, k), l_cfg["temperature"][qt])
             z = raw_rows[j] / t_scale
             p = np.exp(z - z.max())
-            p = p / p.sum()
+            p /= p.sum()
 
             # The row comes back in slot order; everything below indexes by option.
             p = unpermute_probs(p, q.get("option_order"))
@@ -1826,6 +1831,14 @@ class Agent(HookRegistry):
             question_types = {qid: self._to_internal(qdef)["t"] for qid, qdef in questions.items()}
         answers = {}
         for qid, qtype in question_types.items():
+            missing = sum(qid not in r["answers"] for r in results)
+            if missing:
+                # End hooks may remove start-added questions, but must not hide a missing
+                # caller answer or an inconsistent set of answers across windows.
+                if missing == len(results) and qid not in asked and evidence["question_types"] is not None:
+                    continue
+                raise ValueError("predict_long: answer %r is missing from %d of %d windows after prediction hooks"
+                                 % (qid, missing, len(results)))
             per = [r["answers"][qid] for r in results]
             if qtype == "noul":
                 # Evidence anywhere: the strongest window decides. Its own P(true) and confidence

@@ -81,6 +81,39 @@ check("mixed types overall -> INSUFFICIENT", mixed["state"], evidence.INSUFFICIE
 malformed = calib({"training": {"laya_train_calibration": {"choice": {"temperature": 1.0}}}})
 check("malformed entry -> UNKNOWN", malformed["types"]["choice"]["state"], evidence.UNKNOWN)
 
+# A JSON `true` is not a count, but `isinstance(True, int)` makes it one. Before this guard
+# `{"items": true}` answered PRESENT with "fitted with no recorded issues on 1 items" and
+# `{"items": false}` answered MISSING with "zero calibration items": two verdicts about a fit that
+# the artifact never reported, and the second one is the state a genuinely unfitted type gets.
+for _flag in (True, False):
+    _t = calib({"training": {"laya_train_calibration": {
+        "choice": {"items": _flag, "temperature": 1.1, "issues": []}}}})
+    check("items=%r is a malformed entry, not a count" % _flag, _t["types"]["choice"]["state"],
+          evidence.UNKNOWN)
+    check("items=%r keeps the malformed reason" % _flag, _t["types"]["choice"]["reason"],
+          "calibration entry is malformed")
+    check("items=%r leaves the overall undecided" % _flag, _t["state"], evidence.INSUFFICIENT)
+
+# The guard is about the type of `items`, not its value: a negative count stays reported, because
+# #964 deleted the local floor that judged it and nothing here is supposed to re-introduce one.
+_neg = calib({"training": {"laya_train_calibration": {
+    "choice": {"items": -5, "temperature": 1.1, "issues": []}}}})
+check("negative items are still reported, not judged", _neg["types"]["choice"]["state"], evidence.PRESENT)
+check("negative items keep their own count in the reason", _neg["types"]["choice"]["reason"],
+      "fitted with no recorded issues on -5 items")
+
+# The rest of the same door, which main already refuses but nothing pinned: a string or a float is
+# not a count, and an entry that is not an object cannot carry one. All three land on the same
+# `UNKNOWN` as a missing key, because none of them states a number the fit can be checked against.
+for _bad, _label in (("5", "a string"), (2.0, "a float")):
+    _t = calib({"training": {"laya_train_calibration": {
+        "choice": {"items": _bad, "temperature": 1.1, "issues": []}}}})
+    check("items=%s is not a count -> UNKNOWN" % _label, _t["types"]["choice"]["state"], evidence.UNKNOWN)
+_not_entry = calib({"training": {"laya_train_calibration": {"choice": "5"}}})
+check("entry that is not an object -> UNKNOWN", _not_entry["types"]["choice"]["state"], evidence.UNKNOWN)
+check("entry that is not an object keeps the malformed reason", _not_entry["types"]["choice"]["reason"],
+      "calibration entry is malformed")
+
 # ------------------------------------------------------ one numeric source of truth
 # `items` is reported here, never judged: #964 deleted the local `_thresholds()` that compared it
 # against copies of `MIN_TYPE_N`/`CALIB_WARN_N`, and the comment describing that mechanism stayed
@@ -256,6 +289,77 @@ check("evidence CLI returns 0 on realistic pair", rc, 0)
 
 rc_bad = evals_cli.main(["evidence", "--checkpoint", os.path.join(tmp, "nope")])
 check("missing checkpoint dir -> usage error 2", rc_bad, 2)
+
+# ... but only that one shape of an unreadable path. `--report` pointing at a directory raised
+# `IsADirectoryError`, an `OSError` that is not a `FileNotFoundError`, so it walked past this
+# handler and out of `main`: a traceback and exit 1, the code `laya-evals` reserves for a quality
+# failure, on the run before it printed anything. The other rows were already usage errors and stay
+# so -- they are here because widening the catch to `OSError` must not swallow them, and because a
+# decode failure named no path, which matters most when the command takes two of them.
+import contextlib
+import io
+
+_dir_report = os.path.join(tmp, "adir")
+os.makedirs(_dir_report)
+_not_object = os.path.join(tmp, "not-an-object.json")
+with open(_not_object, "w", encoding="utf-8") as f:
+    json.dump([1, 2], f)
+_not_json = os.path.join(tmp, "not-json.json")
+with open(_not_json, "w", encoding="utf-8") as f:
+    f.write("{nope")
+_not_text = os.path.join(tmp, "not-text.json")
+with open(_not_text, "wb") as f:
+    f.write(b"\xff\xfe\x00\x01binary")
+# `json` reports unclosable depth as a `RecursionError`, which is neither a `ValueError` decode
+# failure nor an `OSError`, so it is the one shape of unreadable artifact that used to reach the
+# caller as a traceback.
+_deep_report = os.path.join(tmp, "deep.json")
+with open(_deep_report, "w", encoding="utf-8") as f:
+    f.write("[" * 100000 + "]" * 100000)
+_bad_config_ckpt = os.path.join(tmp, "ckpt-bad-config")
+os.makedirs(_bad_config_ckpt)
+with open(os.path.join(_bad_config_ckpt, "rl_agent_config.json"), "w", encoding="utf-8") as f:
+    f.write("{nope")
+
+# The last tuple element is the string the refusal must contain. For five rows that is the whole
+# path, because `laya/evidence.py` builds those messages from the argument the caller passed. The
+# directory row is the exception: its refusal is the operating system's own `OSError` text, and the
+# Windows CI runner reports that path in 8.3 form (`C:\Users\RUNNER~1\...` where the test holds
+# `C:\Users\runneradmin\...`), so an exact full-path match there tests the runner's temp layout
+# rather than the message. Its fixture is named `adir` -- short enough to be its own 8.3 name --
+# and the leaf is what the row asserts, because naming the file the caller passed is the property.
+for _label, _argv, _expect in (
+        ("--report is a directory", ["evidence", "--checkpoint", ckpt, "--report", _dir_report],
+         os.path.basename(_dir_report)),
+        ("--report is JSON but not an object",
+         ["evidence", "--checkpoint", ckpt, "--report", _not_object], _not_object),
+        ("--report is not JSON", ["evidence", "--checkpoint", ckpt, "--report", _not_json],
+         _not_json),
+        ("--report is not UTF-8 text", ["evidence", "--checkpoint", ckpt, "--report", _not_text],
+         _not_text),
+        ("--report is JSON nested too deep to read",
+         ["evidence", "--checkpoint", ckpt, "--report", _deep_report], _deep_report),
+        ("the checkpoint's own config is not JSON",
+         ["evidence", "--checkpoint", _bad_config_ckpt],
+         os.path.join(_bad_config_ckpt, "rl_agent_config.json"))):
+    _err = io.StringIO()
+    with contextlib.redirect_stderr(_err):
+        _rc = evals_cli.main(_argv)
+    check("evidence CLI: %s -> usage error 2" % _label, _rc, 2)
+    check_true("evidence CLI: %s prints no traceback" % _label, "Traceback" not in _err.getvalue())
+    check_true("evidence CLI: %s names the path" % _label, _expect in _err.getvalue())
+
+# The table asserts the path because that is the property all six rows share. For the depth row the
+# *kind* has to be pinned separately: a refusal that reused "is not valid JSON" would still exit 2 and
+# still name the file, and would tell the caller their artifact is malformed when it is only nested
+# deeper than `json` walks -- a different fix. Reusing the decode wording is the mistake this checks.
+_err = io.StringIO()
+with contextlib.redirect_stderr(_err):
+    _rc = evals_cli.main(["evidence", "--checkpoint", ckpt, "--report", _deep_report])
+check("evidence CLI: a too-deep --report is still usage error 2", _rc, 2)
+check_true("evidence CLI: a too-deep --report is refused as depth",
+           "nested deeper than it can be read" in _err.getvalue())
+check_true("and not as a document that fails to parse", "is not valid JSON" not in _err.getvalue())
 
 # ... and on the artifact the research harness actually writes: identity at the document's top
 # level, no `config` key. Read through `inspect_checkpoint`/`format_summary`, which is the whole of

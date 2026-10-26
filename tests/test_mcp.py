@@ -41,6 +41,7 @@ from laya.mcp.tools import (  # noqa: E402
     laya_decide,
     laya_predict,
     laya_predict_batch,
+    laya_predict_long,
     laya_preset,
     laya_route,
     laya_route_batch,
@@ -1358,13 +1359,24 @@ def test_batch_predict():
        "min_confidence" not in kwargs and "sort_by_length" not in kwargs, repr(kwargs))
     
     # Call-level controls are validated up front like every sibling tool: a bad value is a clean
-    # ToolError, not an internal_error that escaped the TypeError-only handler, and not a silent
-    # 1-second hook deadline from core's float(True) == 1.0.
+    # ToolError, not an internal_error that escaped the TypeError-only handler. A bool is refused
+    # here before core sees it, so the caller hears `invalid_hooks_timeout` rather than the core
+    # refusal `laya/hooks.py::validate_timeout` raises for the same mistake.
     expect_tool_error("batch/min_confidence_out_of_range",
                       lambda: laya_predict_batch(BATCH_REQUESTS, min_confidence=1.5, router=BatchRouter()),
                       "invalid_min_confidence")
     expect_tool_error("batch/hooks_timeout_bool_rejected",
                       lambda: laya_predict_batch(BATCH_REQUESTS, hooks_timeout=True, router=BatchRouter()),
+                      "invalid_hooks_timeout")
+    # A list and a JSON integer too large for a float are also bad deadlines. `_validate_hooks_timeout`
+    # catches only (TypeError, ValueError), so before core refused them as a ValueError the giant int
+    # escaped as an `OverflowError` and surfaced as `internal_error` -- the failure this handler exists
+    # to prevent. Both must now come back as `invalid_hooks_timeout`.
+    expect_tool_error("batch/hooks_timeout_list_rejected",
+                      lambda: laya_predict_batch(BATCH_REQUESTS, hooks_timeout=[10], router=BatchRouter()),
+                      "invalid_hooks_timeout")
+    expect_tool_error("batch/hooks_timeout_oversized_int_rejected",
+                      lambda: laya_predict_batch(BATCH_REQUESTS, hooks_timeout=10 ** 1000, router=BatchRouter()),
                       "invalid_hooks_timeout")
     # min_confidence=0.0 is a real gate (abstain over nothing) and must still be forwarded.
     router = BatchRouter()
@@ -1406,11 +1418,32 @@ def test_batch_tool_control_forwarding():
         server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=0)
         ok("batch_tool/hooks_timeout_zero_is_unset", seen["kwargs"]["hooks_timeout"] is None,
            repr(seen["kwargs"]["hooks_timeout"]))
+        # The collapse compares values rather than testing identity: `hooks_timeout` is declared a
+        # number, so a JSON client is free to send its default as `0.0`, and `0.0 == 0` while
+        # `0.0 is 0` is False.
+        server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=0.0)
+        ok("batch_tool/hooks_timeout_float_zero_is_unset", seen["kwargs"]["hooks_timeout"] is None,
+           repr(seen["kwargs"]["hooks_timeout"]))
         server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS)
         ok("batch_tool/hooks_timeout_default_is_unset", seen["kwargs"]["hooks_timeout"] is None,
            repr(seen["kwargs"]["hooks_timeout"]))
         ok("batch_tool/min_confidence_default_is_unset", seen["kwargs"]["min_confidence"] is None,
            repr(seen["kwargs"]["min_confidence"]))
+        # `batch_size` is declared `int = 0` for the same eager-default reason, so 0 is its unset
+        # marker too -- and a real cap is forwarded untouched.
+        server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, batch_size=0)
+        ok("batch_tool/batch_size_zero_is_unset", seen["kwargs"]["batch_size"] is None,
+           repr(seen["kwargs"]["batch_size"]))
+        # JSON has no integer type, so an eager client can send the declared-int default as `0.0`.
+        server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, batch_size=0.0)
+        ok("batch_tool/batch_size_float_zero_is_unset", seen["kwargs"]["batch_size"] is None,
+           repr(seen["kwargs"]["batch_size"]))
+        server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS)
+        ok("batch_tool/batch_size_default_is_unset", seen["kwargs"]["batch_size"] is None,
+           repr(seen["kwargs"]["batch_size"]))
+        server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, batch_size=2)
+        ok("batch_tool/batch_size_forwarded", seen["kwargs"]["batch_size"] == 2,
+           repr(seen["kwargs"]["batch_size"]))
 
         # A value in range is forwarded as given.
         server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=1.5,
@@ -1426,6 +1459,9 @@ def test_batch_tool_control_forwarding():
             server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=bad)
             ok("batch_tool/hooks_timeout_%r_reaches_tools" % (bad,),
                seen["kwargs"]["hooks_timeout"] is bad, repr(seen["kwargs"]["hooks_timeout"]))
+            server_mod.laya_predict_batch_tool(requests=BATCH_REQUESTS, batch_size=bad)
+            ok("batch_tool/batch_size_%r_reaches_tools" % (bad,),
+               seen["kwargs"]["batch_size"] is bad, repr(seen["kwargs"]["batch_size"]))
 
         # Out of range reaches the tools layer untouched instead of being folded into "unset".
         for bad in (-1.0, -0.5):
@@ -1447,6 +1483,10 @@ def test_batch_tool_control_forwarding():
                       lambda: laya_predict_batch(BATCH_REQUESTS, hooks_timeout=False,
                                                  router=BatchRouter()),
                       "invalid_hooks_timeout")
+    expect_tool_error("batch_tool/batch_size_false_rejected_downstream",
+                      lambda: laya_predict_batch(BATCH_REQUESTS, batch_size=False,
+                                                 router=BatchRouter()),
+                      "invalid_batch_size")
     expect_tool_error("batch_tool/min_confidence_rejected_downstream",
                       lambda: laya_predict_batch(BATCH_REQUESTS, min_confidence=-0.5,
                                                  router=BatchRouter()),
@@ -1514,6 +1554,66 @@ def test_batch_route():
     expect_tool_error("batch/route_count_mismatch",
                       lambda: laya_route_batch(BATCH_REQUESTS, router=ShortRouter()),
                       "internal_error")
+
+
+def test_route_batch_tool_hooks_timeout_forwarding():
+    """`laya_route_batch_tool` must not fold a boolean `hooks_timeout` into "unset".
+
+    The door collapses `0` to None because MCP clients send a declared default eagerly and
+    `Router.route_batch` reads None as "use my own timeout". But `False == 0`, so that same fold
+    swallowed a caller's `hooks_timeout=false`, which `laya_route_batch` refuses by name
+    (`invalid_hooks_timeout`) -- exactly the collapse the sibling door on `laya_predict_batch`
+    already excludes booleans from, for the reason `test_batch_tool_control_forwarding` states.
+    """
+    import laya.mcp.server as server_mod
+
+    seen = {}
+
+    def fake_wrap(fn, **kwargs):
+        seen["kwargs"] = kwargs
+        return "{}"
+
+    real_router_or_error, real_wrap = server_mod._router_or_error, server_mod._wrap
+
+    def fake_router_or_error():
+        return BatchRouter()
+
+    server_mod._router_or_error = fake_router_or_error
+    server_mod._wrap = fake_wrap
+    try:
+        server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=0)
+        ok("route_batch_tool/hooks_timeout_zero_is_unset", seen["kwargs"]["hooks_timeout"] is None,
+           repr(seen["kwargs"]["hooks_timeout"]))
+        # A JSON client is free to send the default as `0.0` for a declared float, and `0.0 == 0`
+        # while `0.0 is 0` is False -- the collapse has to compare, not test identity.
+        server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=0.0)
+        ok("route_batch_tool/hooks_timeout_float_zero_is_unset",
+           seen["kwargs"]["hooks_timeout"] is None, repr(seen["kwargs"]["hooks_timeout"]))
+        server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS)
+        ok("route_batch_tool/hooks_timeout_default_is_unset", seen["kwargs"]["hooks_timeout"] is None,
+           repr(seen["kwargs"]["hooks_timeout"]))
+        server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=1.5)
+        ok("route_batch_tool/hooks_timeout_forwarded", seen["kwargs"]["hooks_timeout"] == 1.5,
+           repr(seen["kwargs"]["hooks_timeout"]))
+
+        # A bool is never an unset marker, and an out-of-range number is not either: both have to
+        # reach the layer that names them.
+        for bad in (True, False):
+            server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=bad)
+            ok("route_batch_tool/hooks_timeout_%r_reaches_tools" % (bad,),
+               seen["kwargs"]["hooks_timeout"] is bad, repr(seen["kwargs"]["hooks_timeout"]))
+        for bad in (-1.0, -0.5):
+            server_mod.laya_route_batch_tool(requests=BATCH_REQUESTS, hooks_timeout=bad)
+            ok("route_batch_tool/hooks_timeout_%r_reaches_tools" % (bad,),
+               seen["kwargs"]["hooks_timeout"] == bad, repr(seen["kwargs"]["hooks_timeout"]))
+    finally:
+        server_mod._router_or_error, server_mod._wrap = real_router_or_error, real_wrap
+
+    # And the tools layer does refuse them, which is what makes the forwarding observable.
+    expect_tool_error("route_batch_tool/hooks_timeout_false_rejected_downstream",
+                      lambda: laya_route_batch(BATCH_REQUESTS, hooks_timeout=False,
+                                               router=BatchRouter()),
+                      "invalid_hooks_timeout")
 
 
 # --- decide tool (mocked router, no weights) ----------------------------------
@@ -1768,6 +1868,151 @@ def test_shortlist_embed_cache():
                    embed_fn=counting_embed)
     ok("shortlist_cache/injected_embed_not_wrapped", len(calls) == 2,
        "calls=%d" % len(calls))
+
+
+# --- long-document scan ----------------------------------------------------
+
+LONG_QUESTIONS = {"refund": {"type": "noul", "instructions": "Does the user ask for a refund?"}}
+
+
+class LongAgent:
+    device = "cpu"
+
+    def __init__(self):
+        self.seen = None
+
+    def predict_long(self, state, questions, window=None, stride=None, aggregate=None,
+                     batch_size=None, lang=None, hooks=None, on_predict_start=None,
+                     on_predict_end=None, hooks_raise=None, hooks_timeout=None):
+        # The exact real `Agent.predict_long` signature, with no `**kwargs` and no `task`:
+        # an Agent answers but never routes, so a forwarded `task` must raise rather than be
+        # silently absorbed. Recording only the non-None controls keeps the "unset stays absent"
+        # assertion while letting a wrongly-forwarded keyword reach the tool as a TypeError.
+        self.seen = {k: v for k, v in (
+            ("window", window), ("stride", stride), ("aggregate", aggregate),
+            ("batch_size", batch_size), ("lang", lang),
+        ) if v is not None}
+        return {"answers": {"refund": {"noul": 0.8, "confidence": 0.7,
+                                       "window": {"index": 0, "token_start": 0,
+                                                  "token_end": 10, "count": 3}}},
+                "usage": {"windows": 3}}
+
+
+class LongRouter:
+    """Fake router with predict_long: records the scan kwargs, answers from window 0."""
+
+    def __init__(self, routed="english"):
+        self.routed = routed
+        self.seen = None
+        self._agents = {"english": LongAgent()}
+
+    def predict_long(self, state, questions, **kwargs):
+        self.seen = kwargs
+        return {"answers": {"refund": {"noul": 0.8, "confidence": 0.7,
+                                       "window": {"index": 0, "token_start": 0,
+                                                  "token_end": 10, "count": 3}}},
+                "routing": {"model": kwargs.get("model", self.routed), "repo": "fake/repo",
+                            "reason": "unit-test scan"},
+                "usage": {"windows": 3}}
+
+
+class NoScanAgent:
+    device = "cpu"
+
+    def predict(self, state, questions, **kwargs):
+        raise AssertionError("predict must not answer a long-document call")
+
+
+def test_predict_long():
+    expect_tool_error("long/state_bad",
+                      lambda: laya_predict_long([], LONG_QUESTIONS, router=LongRouter()),
+                      "invalid_state")
+    expect_tool_error("long/questions_bad",
+                      lambda: laya_predict_long(STATE, {}, router=LongRouter()),
+                      "invalid_questions")
+    expect_tool_error("long/model_bad",
+                      lambda: laya_predict_long(STATE, LONG_QUESTIONS, model="gpt4",
+                                               router=LongRouter()),
+                      "invalid_model")
+    for bad in (0, -3, True, 2.5, "256"):
+        expect_tool_error("long/window_bad_%r" % (bad,),
+                          lambda b=bad: laya_predict_long(STATE, LONG_QUESTIONS, window=b,
+                                                          router=LongRouter()),
+                          "invalid_window")
+        expect_tool_error("long/stride_bad_%r" % (bad,),
+                          lambda b=bad: laya_predict_long(STATE, LONG_QUESTIONS, stride=b,
+                                                          router=LongRouter()),
+                          "invalid_stride")
+    expect_tool_error("long/task_with_pinned_model",
+                      lambda: laya_predict_long(STATE, LONG_QUESTIONS, model="english",
+                                               task="triage", router=LongRouter()),
+                      "invalid_task")
+    expect_tool_error("long/auto_needs_router",
+                      lambda: laya_predict_long(STATE, LONG_QUESTIONS), "models_not_ready")
+    expect_tool_error("long/explicit_not_loaded",
+                      lambda: laya_predict_long(STATE, LONG_QUESTIONS, model="english"),
+                      "models_not_ready")
+    expect_tool_error("long/no_scan_method",
+                      lambda: laya_predict_long(STATE, LONG_QUESTIONS, model="english",
+                                               agent=NoScanAgent()),
+                      "internal_error")
+
+    # Auto mode scans through the router: unset scan controls are not forwarded, so a
+    # checkpoint that predates those keywords keeps working.
+    router = LongRouter()
+    out = laya_predict_long(STATE, LONG_QUESTIONS, router=router)
+    ok("long/scan_kwargs_unset_absent", router.seen == {}, repr(router.seen))
+    ok("long/answers", out["answers"]["refund"]["noul"] == 0.8, repr(out["answers"]))
+    ok("long/window_attribution",
+       out["answers"]["refund"]["window"] == {"index": 0, "token_start": 0,
+                                              "token_end": 10, "count": 3},
+       repr(out["answers"]))
+    ok("long/windows", out["windows"] == 3, repr(out))
+    ok("long/routing", out["routing"]["model"] == "english", repr(out["routing"]))
+    ok("long/device", out.get("device") == "cpu", repr(out.get("device")))
+    ok("long/latency", isinstance(out["latency_ms"], float))
+
+    # Set values travel: window/stride size the scan, lang rides for calibration.
+    router = LongRouter()
+    laya_predict_long(STATE, LONG_QUESTIONS, window=256, stride=128, lang="de", router=router)
+    ok("long/scan_kwargs_forwarded", router.seen == {"window": 256, "stride": 128, "lang": "de"},
+       repr(router.seen))
+
+    # Explicit model pins the scan: task would have nothing to route, the model rides along.
+    router = LongRouter()
+    out = laya_predict_long(STATE, LONG_QUESTIONS, model="english", task=None, router=router)
+    ok("long/explicit_model_forwarded", router.seen == {"model": "english"}, repr(router.seen))
+    ok("long/explicit_routing",
+       out["routing"] == {"model": "english", "repo": None, "reason": "explicit model"},
+       repr(out["routing"]))
+
+    # Explicit model with an injected agent answers directly, device read off it.
+    agent = LongAgent()
+    out = laya_predict_long(STATE, LONG_QUESTIONS, model="english", agent=agent)
+    ok("long/agent_answers", out["answers"]["refund"]["noul"] == 0.8, repr(out["answers"]))
+    ok("long/agent_scan_kwargs", agent.seen == {}, repr(agent.seen))
+    ok("long/agent_routing",
+       out["routing"] == {"model": "english", "repo": None, "reason": "explicit model"},
+       repr(out["routing"]))
+    ok("long/agent_device", out.get("device") == "cpu", repr(out.get("device")))
+    ok("long/agent_windows", out["windows"] == 3, repr(out))
+
+    # Auto mode with a bare agent: no routing happened, so no model is named.
+    agent = LongAgent()
+    out = laya_predict_long(STATE, LONG_QUESTIONS, agent=agent)
+    ok("long/bare_agent_routing",
+       out["routing"] == {"model": None, "repo": None, "reason": "auto routing without router"},
+       repr(out["routing"]))
+    ok("long/bare_agent_no_device", "device" not in out, repr(out))
+
+    # Auto + a bare agent + a task: the Agent cannot route between checkpoints, so `task` must be
+    # dropped before the scan. `Agent.predict_long` has no such parameter -- forwarding it surfaces
+    # as a raw TypeError (an opaque internal_error over the tool boundary) instead of an answer.
+    # This is the branch the pinned-model guard at the top of the tool never reaches.
+    agent = LongAgent()
+    out = laya_predict_long(STATE, LONG_QUESTIONS, task="typed_decisions", agent=agent)
+    ok("long/bare_agent_task_dropped", "task" not in agent.seen, repr(agent.seen))
+    ok("long/bare_agent_task_answers", out["answers"]["refund"]["noul"] == 0.8, repr(out))
 
 
 # --- per-call controls: task / lang / max_len / head_max_len -------------------
@@ -2119,7 +2364,10 @@ def test_controls_signature_and_schema():
 
     controls = ["task", "lang", "lang_guess", "max_len", "head_max_len"]
     for fn, want in ((laya_predict, controls), (laya_shortlist, controls), (laya_tournament, controls),
-                     (laya_preset, controls), (laya_route, ["model", "task", "lang", "lang_guess"])):
+                     (laya_preset, controls), (laya_route, ["model", "task", "lang", "lang_guess"]),
+                     # predict_long sizes the scan by window/stride, not the single-window
+                     # budgets, so only the routing overrides are shared controls here.
+                     (laya_predict_long, ["task", "lang"])):
         params = inspect.signature(fn).parameters
         for name in want:
             ok("signature/%s_has_%s" % (fn.__name__, name), name in params, repr(sorted(params)))
@@ -2133,7 +2381,8 @@ def test_controls_signature_and_schema():
 
     by_name = {t.name: t for t in asyncio.run(mcp_server.list_tools())}
     for name, want in (("laya_predict", controls), ("laya_shortlist", controls), ("laya_tournament", controls),
-                       ("laya_preset", controls), ("laya_route", ["model", "task", "lang"])):
+                       ("laya_preset", controls), ("laya_route", ["model", "task", "lang"]),
+                       ("laya_predict_long", ["task", "lang"])):
         tool = by_name[name]
         schema = tool.input_schema if hasattr(tool, "input_schema") else tool.inputSchema
         props = schema.get("properties", {})
@@ -2620,7 +2869,7 @@ def test_timeout_removed():
     import laya.mcp.tools as tools_mod
 
     for fn in (laya_predict, laya_route, laya_preset, laya_shortlist,
-               laya_predict_batch, laya_route_batch, laya_decide):
+               laya_predict_batch, laya_route_batch, laya_decide, laya_predict_long):
         ok("timeout/param_absent_%s" % fn.__name__, "timeout" not in inspect.signature(fn).parameters)
     ok("timeout/executor_absent", "ThreadPoolExecutor" not in inspect.getsource(tools_mod))
 
@@ -2914,10 +3163,12 @@ def test_server_registration():
     tools = asyncio.run(mcp_server.list_tools())
     names = sorted(t.name for t in tools)
     ok("server/tool_names", names == ["laya_decide", "laya_predict", "laya_predict_batch",
-                                      "laya_preset", "laya_route", "laya_route_batch",
-                                      "laya_shortlist", "laya_status", "laya_tournament"], repr(names))
+                                      "laya_predict_long", "laya_preset", "laya_route",
+                                      "laya_route_batch", "laya_shortlist", "laya_status",
+                                      "laya_tournament"], repr(names))
     decision = {"laya_predict", "laya_route", "laya_preset", "laya_shortlist",
-                "laya_predict_batch", "laya_route_batch", "laya_decide", "laya_tournament"}
+                "laya_predict_batch", "laya_route_batch", "laya_decide", "laya_tournament",
+                "laya_predict_long"}
     for t in tools:
         desc = (t.description or "").lower()
         ok("server/desc_%s_nonempty" % t.name, bool(desc.strip()), repr(desc))
@@ -3120,7 +3371,7 @@ def test_cli_mcp_page_tool_argument_rows():
                     return cells[2]
         return None
 
-    for tool in ("laya_status", "laya_route", "laya_predict",
+    for tool in ("laya_status", "laya_route", "laya_predict", "laya_predict_long",
                  "laya_shortlist", "laya_tournament", "laya_preset", "laya_decide"):
         cell = row_cell(tool)
         ok("docs-mcp/args_row_%s_present" % tool, cell is not None, "row not found")
@@ -3159,9 +3410,11 @@ test_batch_validation()
 test_batch_predict()
 test_batch_tool_control_forwarding()
 test_batch_route()
+test_route_batch_tool_hooks_timeout_forwarding()
 test_decide()
 test_shortlist_lang_parity()
 test_shortlist_embed_cache()
+test_predict_long()
 test_controls_validation()
 test_controls_predict()
 test_controls_route()

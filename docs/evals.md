@@ -236,6 +236,17 @@ python scripts/export_onnx.py --model convaiinnovations/laya --output laya.onnx 
 laya-evals run data.jsonl --onnx laya.int8.onnx --max-ece 0.05
 ```
 
+The export **verifies itself before it exits**: it runs the graph it just wrote in ONNX Runtime at
+batch 1, 2 and 3 and compares against PyTorch, and `scripts/export_onnx.py --quantize` does the same
+for the INT8 copy at a looser tolerance. A graph that cannot serve more than one question fails the
+export instead of being written and deployed. That needs `onnxruntime` (`pip install laya[onnx]`);
+`scripts/export_onnx.py --no-verify` skips it if you only have the exporter installed.
+
+Marker width is dynamic in the exported graph for two or more markers (a graph traced at 2 runs at
+3, 4, 5 and 8), but exactly one marker is baked out by a Python branch in the model, so a
+one-criterion `score` question is not servable from ONNX when every question in the batch has one
+criterion; use the torch path for those. There is no need to re-export per criteria count.
+
 `--model` names the checkpoint the export came from — a Hub id or local path, not a Router
 short name like `english`, since there is no Router on this path (default
 `convaiinnovations/laya`). Its config and tokenizer are loaded from there. The agent serves one checkpoint, so a dataset row
@@ -272,6 +283,12 @@ One JSON object per line (JSONL). Blank lines and lines starting with `#` are ig
 | `model` | no | force a checkpoint for this row; `--model` overrides it. A row that forces nothing is labelled with whatever checkpoint the `Router` answered with |
 
 `research/evals/dataset.template.jsonl` has a commented example.
+
+A row built in Python with `Example(...)` is held to the same three rules as a JSONL row: `Dataset`
+refuses one whose `questions` or `expected` is not an object, or whose `expected` names a question
+`questions` does not carry, and quotes the row's index in the message. Both routes fail as
+`EvalError` before the first model call, so a mistake in a dataset never arrives as a verdict about
+the runner.
 
 ## Metrics
 
@@ -548,7 +565,9 @@ caller driving `laya.evals.evaluate` directly gets the same identity a CLI run d
 
 - Keep the dataset, a baseline report (`--json` output you have reviewed), and the tolerances
   together, committed, so a change is a reviewable diff. `--tolerance METRIC=VALUE` is the
-  maximum absolute drift allowed for that metric.
+  maximum absolute drift allowed for that metric. It has to be a limit that can fail: `Infinity`
+  is one every finite drift fits inside, so it is refused rather than read as no gate for that
+  metric.
 - `laya-evals run ... --baseline baseline.json --tolerance ...` exits non-zero on drift, so it
   drops into CI unchanged. `laya.evals.EvalReport.compare` and `assert_regression` expose the
   same logic for tests.
@@ -583,9 +602,13 @@ The harness is deterministic for a fixed checkpoint revision, so a report is rep
 `run` records the dataset, model and device, plus the [timing](#batching-and-timing) facts of the
 run, in the report's `config` block, and `revisions`: the commit each checkpoint that answered was
 actually loaded from. `--revision <SHA>` pins that commit for every checkpoint the run loads, and
-`--revision english=<SHA>` pins one checkpoint (repeatable) — which is the form an auto-routing run
+`--revision english=<SHA>` pins one checkpoint — which is the form an auto-routing run
 wants, since the three checkpoints are three repositories and one commit cannot exist in all of
-them. Left unpinned, the run takes the checkpoint's default branch and the report still says which
+them. Repeat a pin to say the same commit twice; two different commits for one checkpoint — however
+it is spelled, so `en=` beside `english=` counts — exit 2 instead of loading whichever came last,
+because `revisions` reports the commit that ANSWERED and a dropped pin would leave no trace. The
+same refusal covers two different bare commits.
+Left unpinned, the run takes the checkpoint's default branch and the report still says which
 commit answered, so a baseline drift can be attributed to the weights or to the code.
 `laya/revisions.py` publishes reviewed commit SHAs in `PINNED_REVISIONS` for callers who want to
 opt in. With `--onnx`, only a bare `--revision <SHA>` applies, to the config and tokenizer download.
@@ -616,10 +639,11 @@ laya-evals evidence --checkpoint ./my-checkpoint [--report report.json]
 
 A checkpoint directory must contain `rl_agent_config.json`. Calibration evidence is derived from
 the persisted `training.laya_train_calibration` block: a legacy checkpoint with no training
-metadata is `UNKNOWN`; a question type with zero items is `MISSING`; a type whose entry records
-any upstream `issues` text (not fitted, below `MIN_TYPE_N`/`CALIB_WARN_N`, clamped, unchanged
-fit) is `INSUFFICIENT`; a clean fit is `PRESENT`. The helper trusts the persisted `issues`
-written by #933 instead of keeping a second numeric threshold source.
+metadata is `UNKNOWN`; an entry whose `items` is not an integer count — a missing key, a string, a
+JSON `true` — is `UNKNOWN` rather than a count of one; a question type with zero items is `MISSING`;
+a type whose entry records any upstream `issues` text (not fitted, below `MIN_TYPE_N`/`CALIB_WARN_N`,
+clamped, unchanged fit) is `INSUFFICIENT`; a clean fit is `PRESENT`. The helper trusts the persisted
+`issues` written by #933 instead of keeping a second numeric threshold source.
 
 The eval report's identity fields (`schema`, `dataset_sha256`, `questions_sha256`, `laya_version`)
 are reported with the same semantics as `run`. The checkpoint↔report relationship is claimed only

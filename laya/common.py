@@ -7,6 +7,7 @@ import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
 from functools import wraps
+from numbers import Integral
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
@@ -764,7 +765,18 @@ def td_lambda_targets(p_true: torch.Tensor, batch: Dict, lam: float = 1.0) -> to
 
 
 def ece_score(conf: np.ndarray, correct: np.ndarray, bins: int = 15) -> float:
-    """Expected Calibration Error across confidence bins."""
+    """Expected Calibration Error across confidence bins.
+
+    `bins` is the number of histogram buckets and must be an integer of at least 1. It is refused
+    rather than misread because `np.linspace(0, 1, bins + 1)` yields no interior edge for `0` and
+    `-1`: the loop body never runs and the function returns `0.0`, the best score ECE can report,
+    for a distribution that is anything but well calibrated. A count that arrives from a config
+    file as `0` therefore turns a calibration gate into one that always passes. `True` is refused
+    with the same argument -- it would silently histogram into a single bucket. Any other
+    `Integral` is accepted, a `numpy.int64` among them, since the arrays here are numpy's own.
+    """
+    if isinstance(bins, bool) or not isinstance(bins, Integral) or bins < 1:
+        raise ValueError("bins must be an integer of at least 1, got %r" % (bins,))
     if len(conf) == 0:
         return float("nan")
     edges = np.linspace(0, 1, bins + 1)
@@ -796,7 +808,8 @@ def answer_confidence(p: np.ndarray, k: int) -> float:
     """
     if k < 1:
         return 1.0
-    return float(np.clip(np.max(p[:k]), 0.0, 1.0))
+    val = float(p[:k].max())
+    return 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
 
 
 def confidence_from_probs(p: np.ndarray, k: int) -> float:
@@ -818,9 +831,17 @@ def confidence_from_probs(p: np.ndarray, k: int) -> float:
     """
     if k < 2:
         return 1.0
-    p = p[:k]
-    ent = -(p * np.log(np.clip(p, 1e-12, 1.0))).sum()
-    return float(np.clip(1.0 - ent / math.log(k), 0.0, 1.0))
+    # The scalar `np.clip` on the score is the part worth replacing (a native comparison is ~4x
+    # the dispatcher); the entropy sum itself stays vectorised. A Python loop over `pk` is faster
+    # below roughly k=40 and slower above it -- 0.9 us vs 2.4 us at k=11, but 14.6 us vs 3.0 us at
+    # k=256 -- and summing in a different order moves the last bits (1.7e-15 over 136k measured
+    # distributions). Both callers `round(..., 4)` this, so that drift is invisible today; it is
+    # the SDK goldens in laya-rust, laya-dotnet and laya-ts that have to keep reproducing these
+    # numbers, and there is no reason to spend bit-exactness on a microsecond.
+    pk = p[:k]
+    ent = -float((pk * np.log(np.clip(pk, 1e-12, 1.0))).sum())
+    score = 1.0 - ent / math.log(k)
+    return 0.0 if score < 0.0 else (1.0 if score > 1.0 else score)
 
 
 def temp_bucket(qtype: int, k: int) -> str:
@@ -952,21 +973,25 @@ def collate_items(batch, pad_id: int):
         return None
     n, L = len(items), max(len(it["ids"]) for it in items)
     kmax = max(len(it["markers"]) for it in items)
-    ids = torch.full((n, L), pad_id, dtype=torch.long)
-    att = torch.zeros((n, L), dtype=torch.long)
-    mpos = torch.zeros((n, kmax), dtype=torch.long)
-    mmask = torch.zeros((n, kmax), dtype=torch.bool)
+    ids = np.full((n, L), pad_id, dtype=np.int64)
+    att = np.zeros((n, L), dtype=np.int64)
+    mpos = np.zeros((n, kmax), dtype=np.int64)
+    mmask = np.zeros((n, kmax), dtype=bool)
     has_target = any("target" in it for it in items)
-    target = torch.zeros((n, kmax), dtype=torch.float32) if has_target else None
+    target = np.zeros((n, kmax), dtype=np.float32) if has_target else None
 
     for i, it in enumerate(items):
-        ids[i, : len(it["ids"])] = torch.tensor(it["ids"])
-        att[i, : len(it["ids"])] = 1
-        k = len(it["markers"])
-        mpos[i, :k] = torch.tensor(it["markers"])
+        it_ids = it["ids"]
+        l_ids = len(it_ids)
+        ids[i, :l_ids] = it_ids
+        att[i, :l_ids] = 1
+        markers = it["markers"]
+        k = len(markers)
+        mpos[i, :k] = markers
         mmask[i, :k] = True
         if has_target and "target" in it:
-            if len(it["target"]) > k:
+            t = it["target"]
+            if len(t) > k:
                 # Otherwise this lands as "The expanded size of the tensor (k) must match the
                 # existing size (kmax)" from inside the assignment, which says nothing about the
                 # actual mistake: a target with more entries than the item has options. The limit
@@ -974,28 +999,29 @@ def collate_items(batch, pad_id: int):
                 # batch a longer sibling row must not legitimise extra entries (#311).
                 raise ValueError(
                     "collate_items: item %d has %d target entries but only %d marker positions; "
-                    "a target needs one entry per option" % (i, len(it["target"]), k))
-            target[i, : len(it["target"])] = torch.tensor(it["target"], dtype=torch.float32)
+                    "a target needs one entry per option" % (i, len(t), k))
+            target[i, : len(t)] = t
 
     res = {
-        "input_ids": ids,
-        "attention_mask": att,
-        "marker_pos": mpos,
-        "marker_mask": mmask,
-        "qtype": torch.tensor([it["qtype"] for it in items]),
-        "label": torch.tensor([it.get("label", -1) for it in items]),
+        "input_ids": torch.from_numpy(ids),
+        "attention_mask": torch.from_numpy(att),
+        "marker_pos": torch.from_numpy(mpos),
+        "marker_mask": torch.from_numpy(mmask),
+        "qtype": torch.from_numpy(np.array([it["qtype"] for it in items], dtype=np.int64)),
+        "label": torch.from_numpy(np.array([it.get("label", -1) for it in items], dtype=np.int64)),
         "meta": [{k: it[k] for k in it if k not in ("ids", "markers", "target", "layout")} for it in items],
     }
     if target is not None:
-        res["target"] = target
+        res["target"] = torch.from_numpy(target)
     if any("layout" in it for it in items):
         # All or none: a batch that mixes layouts would run half its rows through the wrong masks
         if not all("layout" in it for it in items):
             raise ValueError("collate_items: some items carry a parallel layout and some do not")
-        pos = torch.zeros((n, L), dtype=torch.long)
-        opt = torch.zeros((n, L), dtype=torch.long)
+        pos = np.zeros((n, L), dtype=np.int64)
+        opt = np.zeros((n, L), dtype=np.int64)
         for i, it in enumerate(items):
-            pos[i, : len(it["ids"])] = torch.tensor(it["layout"]["position_ids"])
-            opt[i, : len(it["ids"])] = torch.tensor(it["layout"]["option_ids"])
-        res["position_ids"], res["option_ids"] = pos, opt
+            l_ids = len(it["ids"])
+            pos[i, :l_ids] = it["layout"]["position_ids"]
+            opt[i, :l_ids] = it["layout"]["option_ids"]
+        res["position_ids"], res["option_ids"] = torch.from_numpy(pos), torch.from_numpy(opt)
     return res

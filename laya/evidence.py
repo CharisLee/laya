@@ -44,7 +44,11 @@ def inspect_calibration(config: Dict[str, Any]) -> Dict[str, Any]:
         return _entry(UNKNOWN, "training metadata present but no calibration block; checkpoint predates #933")
     types: Dict[str, Any] = {}
     for name, entry in calibration.items():
-        if not isinstance(entry, dict) or not isinstance(entry.get("items"), int):
+        # `isinstance(True, int)` is True, so a JSON `true` in `items` read as a count of one and a
+        # `false` as zero. Both are type errors, unlike a negative count, which stays reported
+        # because #964 deleted the floor that judged the number.
+        if (not isinstance(entry, dict) or isinstance(entry.get("items"), bool)
+                or not isinstance(entry.get("items"), int)):
             types[name] = _entry(UNKNOWN, "calibration entry is malformed")
             continue
         items = entry["items"]
@@ -169,21 +173,43 @@ def relate(config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
     return _entry(UNKNOWN, "no immutable shared checkpoint identity between this checkpoint artifact and the report")
 
 
+def _read_json_object(path: str) -> Dict[str, Any]:
+    """One artifact's JSON object, or a failure that names the file it came from.
+
+    A `json.JSONDecodeError` says what is wrong with the text and nothing about which file, and a
+    `UnicodeDecodeError` says the same about the encoding. `inspect_checkpoint` reads two of them
+    from two different arguments, so a refusal that omits the path cannot say which artifact is
+    broken -- the only thing the caller can act on. Same reason `laya/evals.py:155` prefixes its
+    dataset rows with the path.
+
+    A `RecursionError` belongs with them for the same reason and by the same argument: `json` reports
+    a nesting depth it will not walk as a stack overflow, which is neither of the two classes above,
+    so a too-deep artifact escaped as a traceback with exit 1 -- the code `laya-evals` keeps for a
+    quality failure -- naming no file at all, exactly the thing this docstring refuses to allow.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError("%s is not valid JSON: %s" % (path, exc)) from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError("%s is not UTF-8 text: %s" % (path, exc)) from exc
+    except RecursionError as exc:
+        raise ValueError("%s is JSON nested deeper than it can be read: %s" % (path, exc)) from exc
+    if not isinstance(document, dict):
+        raise ValueError("%s is not a JSON object" % path)
+    return document
+
+
 def inspect_checkpoint(checkpoint_dir: str, report_path: Optional[str] = None) -> Dict[str, Any]:
     """Full read-only evidence inspection for one checkpoint (optionally one report)."""
     config_path = os.path.join(checkpoint_dir, "rl_agent_config.json")
     if not os.path.isdir(checkpoint_dir) or not os.path.isfile(config_path):
         raise FileNotFoundError("no rl_agent_config.json under %r" % checkpoint_dir)
-    with open(config_path, "r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    if not isinstance(config, dict):
-        raise ValueError("%s is not a JSON object" % config_path)
+    config = _read_json_object(config_path)
     out: Dict[str, Any] = {"checkpoint": checkpoint_dir, "calibration": inspect_calibration(config)}
     if report_path is not None:
-        with open(report_path, "r", encoding="utf-8") as handle:
-            report = json.load(handle)
-        if not isinstance(report, dict):
-            raise ValueError("%s is not a JSON object" % report_path)
+        report = _read_json_object(report_path)
         out["report"] = inspect_report(report)
         out["relationship"] = relate(config, report)
     return out

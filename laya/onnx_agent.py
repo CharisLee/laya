@@ -15,14 +15,13 @@ from laya.hooks import (
 from laya.revisions import resolve_revision, snapshot_revision, verify_digests
 from laya.common import (
     QTYPES,
+    _reuse_question_tokens,
     answer_confidence,
     build_sequence,
     collapsed_options,
-    collate_items,
     confidence_from_probs,
     encode_text,
     render_criterion,
-    render_options,
     resolve_lang_temperatures,
     serialize_state,
     window_batch_cap,
@@ -35,6 +34,43 @@ from laya.common import (
     clamp_temperature,
 )
 from laya.confidence import apply_confidence_gate, check_min_confidence
+
+
+def _collate_items_numpy(batch: List[List[Dict[str, Any]]], pad_id: int) -> Dict[str, np.ndarray]:
+    """Collate encoded question rows across states directly into NumPy arrays for ONNX Runtime."""
+    items = [it for group in batch for it in group]
+    if not items:
+        return {}
+    n = len(items)
+    L = max(len(it["ids"]) for it in items)
+    kmax = max(len(it["markers"]) for it in items)
+    # The exported head takes `topk(2)` of the option probabilities: the eager forward's
+    # one-option branch is a Python `if`, which the trace bakes in, so ONNX Runtime refuses
+    # a run whose questions all have one option. Allocating at least 2 marker columns gives
+    # the masked second slot the act head expects without needing a post-collation np.pad.
+    k_cols = max(kmax, 2)
+
+    ids = np.full((n, L), pad_id, dtype=np.int64)
+    att = np.zeros((n, L), dtype=np.int64)
+    mpos = np.zeros((n, k_cols), dtype=np.int64)
+    mmask = np.zeros((n, k_cols), dtype=bool)
+
+    for i, it in enumerate(items):
+        it_ids = it["ids"]
+        ids[i, :len(it_ids)] = it_ids
+        att[i, :len(it_ids)] = 1
+        markers = it["markers"]
+        k = len(markers)
+        mpos[i, :k] = markers
+        mmask[i, :k] = True
+
+    return {
+        "input_ids": ids,
+        "attention_mask": att,
+        "marker_pos": mpos,
+        "marker_mask": mmask,
+        "qtype": np.array([it["qtype"] for it in items], dtype=np.int64),
+    }
 
 
 class ONNXAgent(HookRegistry):
@@ -92,6 +128,9 @@ class ONNXAgent(HookRegistry):
                                code, each `{"temperature": [3 floats], "temperature_by_options": {}}`.
                                Applied when a `lang=` is passed to `system_one`/`predict`, mirroring
                                the PyTorch `Agent`; a cross-backend swap otherwise loses calibration.
+            calibration: Optional path to a JSON map written by `Agent.save_calibration`
+                         (see `Agent.load_calibration`), read onto this agent after its
+                         checkpoint temperatures; exactly as the PyTorch `Agent` does.
         """
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
@@ -100,6 +139,13 @@ class ONNXAgent(HookRegistry):
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
         self.model_id = model_id_or_path
+        # The PyTorch `Agent` carries these two names (`agent.py:385-386`) and `calibrate`'s
+        # identity check reads them off whatever object it is handed. Without them here every v2
+        # payload's recorded checkpoint compares against `None`, so the mismatch branch always
+        # fires -- even for the very checkpoint this agent loaded. Mirror `Agent` so the check can
+        # actually match and `load_calibration`'s documented mismatch warning means something.
+        self.model_id_or_path = model_id_or_path
+        self.subfolder = subfolder
 
         import onnxruntime as ort
         from transformers import AutoTokenizer
@@ -218,7 +264,13 @@ class ONNXAgent(HookRegistry):
             self.load_calibration(calibration)
 
     def load_calibration(self, path: str) -> None:
-        """Read a JSON map written by `save_calibration` onto this agent."""
+        """Read a JSON map written by `save_calibration` onto this agent.
+
+        A file with no `version` is treated as version 1 and still loads. A newer file
+        whose recorded checkpoint does not match this agent warns and still loads.
+        Values that are not numbers, or that sit outside `[TEMP_MIN, TEMP_MAX]`, are clamped
+        with `clamp_temperature` the same way checkpoint load is.
+        """
         from .calibrate import apply_calibration_payload
         with open(path) as f:
             payload = json.load(f)
@@ -286,6 +338,7 @@ class ONNXAgent(HookRegistry):
                                   max_len=max_len, head_max_len=head_max_len,
                                   min_confidence=min_confidence)[0]
 
+    @_reuse_question_tokens
     def predict_batch(self, states: List[Union[str, dict, list]], questions: Dict[str, Dict[str, Any]],
                       batch_size: Optional[int] = None, lang: Optional[str] = None,
                       hooks=None, on_predict_start=None, on_predict_end=None,
@@ -570,6 +623,14 @@ class ONNXAgent(HookRegistry):
             question_types = {qid: self._to_internal(qdef)["t"] for qid, qdef in questions.items()}
         answers = {}
         for qid, qtype in question_types.items():
+            missing = sum(qid not in r["answers"] for r in results)
+            if missing:
+                # End hooks may remove start-added questions, but must not hide a missing
+                # caller answer or an inconsistent set of answers across windows.
+                if missing == len(results) and qid not in asked and evidence["question_types"] is not None:
+                    continue
+                raise ValueError("predict_long: answer %r is missing from %d of %d windows after prediction hooks"
+                                 % (qid, missing, len(results)))
             per = [r["answers"][qid] for r in results]
             if qtype == "noul":
                 # Evidence anywhere: the strongest window decides, carrying its own P(true),
@@ -642,7 +703,7 @@ class ONNXAgent(HookRegistry):
                 truncate_left=truncate_left, state_ids=state_ids, return_stats=True,
                 return_truncation_stats=True,
             )
-            n_opts = len(render_options(q))
+            n_opts = stats["options"]
             if len(markers) != n_opts:
                 # Same diagnosis as `Agent._encode_state`, so both backends report the same thing.
                 # The markers are placed at absolute positions and `build_sequence` drops the ones
@@ -677,7 +738,7 @@ class ONNXAgent(HookRegistry):
                 t_scale = l_cfg["temperature_by_options"].get(temp_bucket(qt, k), l_cfg["temperature"][qt])
             z = logits[offset + r, :k] / t_scale
             p = np.exp(z - z.max())
-            p = p / p.sum()
+            p /= p.sum()
 
             # The row comes back in slot order; everything below indexes by option.
             p = unpermute_probs(p, q.get("option_order"))
@@ -771,28 +832,7 @@ class ONNXAgent(HookRegistry):
                 indices = order[offset:offset + chunk]
                 per_state_items = [encoded[i] for i in indices]
 
-                b = collate_items(per_state_items, self.tok.pad_token_id)
-
-                marker_pos = b["marker_pos"].numpy().astype(np.int64)
-                marker_mask = b["marker_mask"].numpy().astype(bool)
-                if marker_pos.shape[1] < 2:
-                    # The exported head takes `topk(2)` of the option probabilities: the eager
-                    # forward's one-option branch is a Python `if`, which the trace bakes in, so
-                    # ONNX Runtime refuses a run whose questions all have one option. A masked
-                    # second slot scores -1e4, is sliced off at decode, and gives the act head the
-                    # zero second probability the eager branch pads in.
-                    width = ((0, 0), (0, 2 - marker_pos.shape[1]))
-                    marker_pos = np.pad(marker_pos, width)
-                    marker_mask = np.pad(marker_mask, width)
-
-                # Prepare ONNX inputs as numpy arrays
-                ort_inputs = {
-                    "input_ids": b["input_ids"].numpy().astype(np.int64),
-                    "attention_mask": b["attention_mask"].numpy().astype(np.int64),
-                    "marker_pos": marker_pos,
-                    "marker_mask": marker_mask,
-                    "qtype": b["qtype"].numpy().astype(np.int64),
-                }
+                ort_inputs = _collate_items_numpy(per_state_items, self.tok.pad_token_id)
 
                 # Run ONNX inference
                 ort_outs = self.session.run(["logits", "act_logits"], ort_inputs)
@@ -802,7 +842,7 @@ class ONNXAgent(HookRegistry):
                 # Compute softmax for actions manually in numpy
                 act_exp = np.exp(act_logits - np.max(act_logits, axis=-1, keepdims=True))
                 act = act_exp / np.sum(act_exp, axis=-1, keepdims=True)
-                att = b["attention_mask"]
+                att = ort_inputs["attention_mask"]
 
                 row = 0
                 for index, items in zip(indices, per_state_items):

@@ -41,6 +41,7 @@ SCRIPT_SUITES = [
     "tests/test_state_budget.py",
     "tests/test_hooks.py",
     "tests/test_hooks_api.py",
+    "tests/test_option_stability.py",
     "tests/test_structured.py",
     "tests/test_structured_api.py",
     "tests/test_structured_docs.py",
@@ -92,6 +93,7 @@ SCRIPT_SUITES = [
     "tests/test_mcp.py",
     "tests/test_mcp_device.py",
     "tests/test_langchain.py",
+    "tests/test_agno.py",
     "tests/test_portability.py",
     "tests/test_guard_document_781.py",
     "tests/test_training.py",
@@ -108,9 +110,11 @@ SCRIPT_SUITES = [
     "tests/test_llamaindex.py",
     "tests/test_langchain_real_mode.py",
     "tests/test_email.py",
+    "tests/test_tools.py",
 ]
 
 PYTEST_SUITES = [
+    "tests/test_lang_diagnostics.py",
     "tests/test_evals_agreement.py",
     "tests/test_evals_tournament.py",
     "tests/test_serve.py",
